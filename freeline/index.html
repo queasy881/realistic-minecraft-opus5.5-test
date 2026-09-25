@@ -314,9 +314,10 @@ const TERRAIN = {
   AHEAD: 880,                 // generate this far ahead (m)
   BEHIND: 90,                 // dispose segments this far behind
   HALF_EXTENT: 430,           // lateral half-width of the generated strip
+  CAST_HALF: 90,              // terrain within this distance of the course centre casts sun shadows
   CORE: 74, MID: 170,         // lateral bands (m from the course centre) with dense / medium grids
   LOD_STEP: [0.8, 2.0, 4.8],  // grid spacing in the core band, per LOD
-  LOD_DIST: [210, 450],       // distance ahead at which LOD 0 -> 1 -> 2
+  LOD_DIST: [170, 450],       // distance ahead at which LOD 0 -> 1 -> 2
   PROFILE_RES: 1,             // m between course-profile samples
   PROFILE_START: -320,        // the profile starts a little uphill of the start line
   DIFFICULTY_DIST: 5200,      // m at which difficulty reaches 100%
@@ -326,8 +327,8 @@ const TERRAIN = {
 const VISUAL = {
   FOV: 62, FOV_PER_MS: 0.3, FOV_MAX: 84,
   SHADOW_EXTENT: 72,          // half-size (m) of the sun's shadow box, which follows the skier
-  FOG_DIST: 2600,             // aerial-perspective scale (m)
-  BG_HAZE_DIST: 9500,         // haze scale for the distant mountain backdrop
+  FOG_DIST: 11000,            // aerial-perspective scale (m): clear, dry mountain air
+  VALLEY_HAZE: 0.35,          // extra haze pooled in the valley below you (0..1)
   EXPOSURE: 0.62,
   BLOOM_STRENGTH: 0.5,
   BLOOM_THRESHOLD: 1.25,
@@ -337,11 +338,21 @@ const VISUAL = {
   TRACK_LIFE: 90,             // s until an old track has fully faded
 };
 
+// Far field: the world-anchored valley + mountain height field beyond the streamed strip.
+const FAR = {
+  ROW: 50,                    // m between rows along the course
+  BEHIND: 3000, AHEAD: 14000, // rows kept behind / ahead of the camera (m)
+  S0: 10, K: 0.035,           // column spacing: S0 at the course centre, +K per metre further out
+  HALF: 12000,                // lateral reach (m)
+  TREELINE: 520,              // forest grows up to ~this height above the valley floor (m)
+  SINK: 60,                   // how far the far field is hidden under the detailed strip (m)
+};
+
 const LIGHT_PRESETS = {
   //           sun elevation / azimuth (deg from the downhill direction, + = left), haze
-  morning:   { el: 27, az: -48, haze: 0.9, tint: [1.0, 0.97, 0.93] },
-  afternoon: { el: 19, az: 52, haze: 1.0, tint: [1.0, 0.95, 0.88] },
-  golden:    { el: 8.5, az: 64, haze: 1.35, tint: [1.0, 0.82, 0.62] },
+  morning:   { el: 24, az: -72, haze: 0.9, tint: [1.0, 0.97, 0.93] },
+  afternoon: { el: 19, az: 100, haze: 1.0, tint: [1.0, 0.95, 0.88] },
+  golden:    { el: 8, az: 118, haze: 1.35, tint: [1.0, 0.82, 0.62] },
 };
 
 const GAME = {
@@ -698,7 +709,7 @@ class Course {
     // cross-section: shallow dish inside the run, banks then valley walls outside it
     const t = a / hw;
     if (t <= 1) h += 1.3 * t * t;
-    else { const e = a - hw; h += 1.3 + 2.6 * e / hw + 0.0042 * e * e / (1 + e / 260); }
+    else { const e = a - hw; h += 1.3 + 2.6 * e / hw + 0.0028 * e * e / (1 + e / 300); }
     // gentle rolls everywhere (faded in after the start so the first metres always fall away
     // downhill; the offsets keep the noise lattice origin, where simplex is steepest, off the start)
     const rollAmp = 0.25 + 0.75 * smoothstep(10, 140, z);
@@ -1342,8 +1353,7 @@ function totalScore() {
 // =====================================================================================
 // SECTION 6 — RENDERER, SKY, LIGHTING & POST-PROCESSING
 // =====================================================================================
-let renderer, scene, camera, bgScene, bgCamera, sun, pmrem, envScene, envRT = null, skyDome, envDome;
-const mountainRings = [];
+let renderer, scene, camera, sun, pmrem, envScene, envRT = null, skyDome, envDome;
 // Uniforms shared by many materials: one write per frame updates sky, fog, snow, spray...
 const U = {
   uTime: { value: 0 },
@@ -1356,7 +1366,8 @@ const U = {
   uHazeColor: { value: new THREE.Color(0.9, 0.94, 1.0) },
   uGroundColor: { value: new THREE.Color(1.2, 1.25, 1.35) },
   uFogDist: { value: VISUAL.FOG_DIST },
-  uFogEnd: { value: TERRAIN.AHEAD - 70 },
+  uFogEnd: { value: 16000 },                              // everything is fully hazed out by here
+  uValleyHaze: { value: VISUAL.VALLEY_HAZE },
   uShadowFade: { value: new THREE.Vector2(VISUAL.SHADOW_EXTENT * 0.72, VISUAL.SHADOW_EXTENT * 0.95) },
   uShadowCenter: { value: new THREE.Vector3() },
   uCloudTex: { value: null },
@@ -1380,31 +1391,35 @@ uniform float uHaze;
 uniform vec3 uHazeColor;
 uniform float uFogDist;
 uniform float uFogEnd;
+uniform float uValleyHaze;
 float flAirMass(float cz) {
   cz = clamp(cz, 0.0, 1.0);
   float zen = acos(cz) * 57.29578;
   return 1.0 / (cz + 0.15 * pow(max(93.885 - zen, 0.001), -1.253));
 }
-vec3 flSky(vec3 dir) {
+vec3 flSkyModel(vec3 dir, float mcap, vec3 beta, float light) {
   float y = dir.y;
   float m = flAirMass(max(y, 0.0) + 0.03);
-  vec3 scat = 1.0 - exp(-uSkyBeta * m);
+  vec3 scat = 1.0 - exp(-beta * min(m, mcap));
   float c = dot(dir, uSunDir);
   float ray = 0.75 * (1.0 + c * c);
   float g = 0.76, g2 = g * g;
   float mie = (1.0 - g2) / pow(max(1.0 + g2 - 2.0 * g * c, 1e-4), 1.5) * 0.0796;
-  vec3 col = uSkyLight * scat * ray;
+  vec3 col = uSkyLight * light * scat * ray;
   float haze = 1.0 - exp(-uHaze * m);
   col += uHazeColor * haze * (0.55 + 4.0 * mie) + uSunColor * mie * 0.05 * (1.0 - scat.b * 0.5);
   float below = 1.0 - smoothstep(-0.22, 0.0, y);               // hazy valley air below the horizon
   return mix(col, uHazeColor * 1.02 + uSkyLight * 0.04, below);
 }
-// Aerial perspective + hiding the far end of the streamed strip + thicker valley haze below you.
+vec3 flSky(vec3 dir) { return flSkyModel(dir, 1e4, uSkyBeta, 1.0); }
+// Aerial perspective: exponential in distance (clear air: mountains 10 km away are soft and
+// blue-grey, not gone), plus haze pooled in the valley below you, plus a fade at the very edge
+// of the far field.
 float flFogAmount(float dist, float dy) {
   float f = 1.0 - exp(-dist / uFogDist);
-  f = max(f, smoothstep(uFogEnd * 0.7, uFogEnd, dist));
-  float below = clamp(-dy / 420.0, 0.0, 1.0);
-  return max(f, below * smoothstep(220.0, 780.0, dist) * 0.6);
+  float valley = clamp(-dy / 1200.0, 0.0, 1.0) * (1.0 - exp(-dist / 3500.0)) * uValleyHaze;
+  f = 1.0 - (1.0 - f) * (1.0 - valley);
+  return max(f, smoothstep(uFogEnd * 0.78, uFogEnd, dist));
 }
 `;
 const HASH_GLSL = /* glsl */`
@@ -1428,31 +1443,32 @@ function createRenderer() {
   document.getElementById('app').appendChild(renderer.domElement);
 
   scene = new THREE.Scene();
-  camera = new THREE.PerspectiveCamera(VISUAL.FOV, window.innerWidth / window.innerHeight, 0.1, 1300);
-  bgScene = new THREE.Scene();
-  bgCamera = new THREE.PerspectiveCamera(VISUAL.FOV, window.innerWidth / window.innerHeight, 20, 60000);
+  // One camera for everything from the skis to mountains 15 km away: near = 0.3 m keeps 24-bit
+  // depth precise enough for that range (~2 cm at 100 m, ~50 m at 15 km).
+  camera = new THREE.PerspectiveCamera(VISUAL.FOV, window.innerWidth / window.innerHeight, 0.3, 40000);
 
   // The sun: one directional light whose shadow box follows the skier (see updateSun).
   sun = new THREE.DirectionalLight(0xffffff, 1);
   sun.castShadow = true;
+  sun.shadow.camera.layers.enable(1);                   // layer 1: shadow-only terrain casters
   scene.add(sun); scene.add(sun.target);
   setShadowSize(2048);
 
-  // Sky dome (drawn first, behind everything) and the environment-capture dome.
+  // Sky dome: drawn LAST among opaque objects with depth testing, so only pixels that nothing
+  // else covered pay for the sky shader. Plus the environment-capture dome.
   skyDome = new THREE.Mesh(new THREE.SphereBufferGeometry(1, 64, 32), new THREE.ShaderMaterial({
-    uniforms: U, vertexShader: SKY_VERT, fragmentShader: SKY_FRAG, side: THREE.BackSide, depthWrite: false, depthTest: false,
+    uniforms: U, vertexShader: SKY_VERT, fragmentShader: SKY_FRAG, side: THREE.BackSide, depthWrite: false, depthTest: true,
   }));
   skyDome.scale.setScalar(30000);
   skyDome.frustumCulled = false;
-  skyDome.renderOrder = -10;
-  bgScene.add(skyDome);
+  skyDome.renderOrder = 100;
+  scene.add(skyDome);
   envScene = new THREE.Scene();
   envDome = new THREE.Mesh(new THREE.SphereBufferGeometry(10, 48, 24), new THREE.ShaderMaterial({
     uniforms: U, defines: { ENV_SKY: 1 }, vertexShader: SKY_VERT, fragmentShader: SKY_FRAG, side: THREE.BackSide, depthWrite: false, depthTest: false,
   }));
   envScene.add(envDome);
   pmrem = new THREE.PMREMGenerator(renderer);
-  buildMountains();
   initPost();
 }
 function setShadowSize(size) {
@@ -1483,7 +1499,12 @@ void main() {
   vec3 dir = normalize(vDir);
   vec3 col = flSky(dir);
 #ifdef ENV_SKY
-  // environment capture: a sunlit snowfield below the horizon -> strong, cool bounce light
+  // Environment capture (the image-based ambient light). Single scattering makes the visible
+  // horizon glow ~10x brighter than the zenith; as a light source that over-brightens everything
+  // and lays a milky sheen on snow at grazing angles. For lighting, the air mass is capped (a
+  // flatter, more even dome) and scaled so the total sky irradiance stays physical (shadowed snow
+  // at ~30% of sunlit snow). Below the horizon: sunlit snowfields -> soft bounce light.
+  col = flSkyModel(dir, 3.0, mix(uSkyBeta, vec3(uSkyBeta.g), 0.25), 2.2);
   col = mix(col, uGroundColor, 1.0 - smoothstep(-0.12, 0.02, dir.y));
 #else
   float c = dot(dir, uSunDir);
@@ -1504,105 +1525,6 @@ void main() {
   #include <encodings_fragment>
 }
 `;
-
-// ---------------------------------------------------------------- distant mountains
-/*
- * Backdrop: rings of big, low-detail mountains kilometres away (never part of the playable
- * strip). Ridged noise sets the skyline; sun-facing flanks are lit, snow sits where slopes are
- * gentle, rock shows on steep faces. Heavy aerial perspective tints them toward the sky colour
- * and their feet dissolve into valley haze — real distant mountains lose detail and contrast.
- */
-const MOUNTAIN_VERT = /* glsl */`
-attribute float aV;
-varying vec3 vWP;
-varying vec3 vN;
-varying float vV;
-void main() {
-  vec4 wp = modelMatrix * vec4(position, 1.0);
-  vWP = wp.xyz; vN = normalize(mat3(modelMatrix) * normal); vV = aV;
-  gl_Position = projectionMatrix * viewMatrix * wp;
-}
-`;
-const MOUNTAIN_FRAG = /* glsl */`
-${SKY_GLSL}
-${HASH_GLSL}
-uniform float uHazeDist;
-uniform vec3 uTint;
-varying vec3 vWP;
-varying vec3 vN;
-varying float vV;
-float flVN(vec2 p) {
-  vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
-  return mix(mix(flHash12(i), flHash12(i + vec2(1, 0)), f.x), mix(flHash12(i + vec2(0, 1)), flHash12(i + vec2(1, 1)), f.x), f.y);
-}
-void main() {
-  vec3 N = normalize(vN);
-  vec3 V = vWP - cameraPosition;
-  float dist = length(V);
-  vec3 dir = V / dist;
-  // snow on gentle slopes, streaks of rock on steep flanks and near ridges
-  float n = flVN(vWP.xz * 0.004) * 0.6 + flVN(vWP.xz * 0.013 + vWP.y * 0.01) * 0.4;
-  float steep = 1.0 - N.y;
-  float rock = smoothstep(0.42, 0.62, steep + (n - 0.5) * 0.35) * smoothstep(0.05, 0.3, vV);
-  vec3 alb = mix(vec3(0.82, 0.86, 0.92), vec3(0.16, 0.15, 0.15) * uTint, rock);
-  float ndl = max(dot(N, uSunDir), 0.0);
-  float wrap = max((dot(N, uSunDir) + 0.3) / 1.3, 0.0);
-  vec3 light = uSunColor * mix(wrap * 0.4, ndl, 0.7) + uSkyLight * 0.26 * (0.7 + 0.3 * N.y);
-  vec3 col = alb * light;
-  // aerial perspective: distance haze plus valley haze toward the mountains' feet
-  float f = 1.0 - exp(-dist / uHazeDist);
-  f = max(f, (1.0 - smoothstep(0.0, 0.45, vV)) * 0.92);
-  col = mix(col, flSky(dir), clamp(f, 0.0, 1.0));
-  gl_FragColor = vec4(col, 1.0);
-  #include <tonemapping_fragment>
-  #include <encodings_fragment>
-}
-`;
-function buildMountains() {
-  const layers = [
-    { radius: 4200, height: 1150, base: 520, seed: 11, tint: [1.0, 1.0, 1.0], haze: 9500 },
-    { radius: 8200, height: 2100, base: 700, seed: 23, tint: [0.95, 0.97, 1.02], haze: 11000 },
-  ];
-  for (const L of layers) {
-    const rng = mulberry32(L.seed), n = new Simplex2D(rng), n2 = new Simplex2D(rng);
-    const COLS = 720, ROWS = 12;
-    const pos = new Float32Array((COLS + 1) * (ROWS + 1) * 3), vv = new Float32Array((COLS + 1) * (ROWS + 1));
-    const idx = [];
-    for (let i = 0; i <= COLS; i++) {
-      const a = (i / COLS) * Math.PI * 2;
-      const s = a * L.radius / 1000;                                         // km along the ring
-      const ridge = n.ridged(s * 0.55 + 10, 3.3, 5);
-      const peak = L.height * (0.25 + 0.95 * ridge * ridge) * (0.65 + 0.35 * (n2.noise(s * 0.12, 7.1) * 0.5 + 0.5));
-      for (let j = 0; j <= ROWS; j++) {
-        const v = j / ROWS;
-        const gully = n2.noise(s * 2.1, v * 3.0 + 1.7) * 0.06 * Math.sin(v * Math.PI);
-        const r = L.radius * (1 - 0.1 * (1 - v) + gully) + 260 * n.noise(s * 0.9, v * 2);
-        const y = -L.base + (peak + L.base) * Math.pow(v, 1.12);
-        const k = (i * (ROWS + 1) + j);
-        pos[k * 3] = Math.sin(a) * r; pos[k * 3 + 1] = y; pos[k * 3 + 2] = Math.cos(a) * r;
-        vv[k] = v;
-        if (i < COLS && j < ROWS) {
-          const a0 = k, b0 = k + (ROWS + 1);
-          idx.push(a0, a0 + 1, b0, b0, a0 + 1, b0 + 1);
-        }
-      }
-    }
-    const g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    g.setAttribute('aV', new THREE.BufferAttribute(vv, 1));
-    g.setIndex(idx);
-    g.computeVertexNormals();
-    const mat = new THREE.ShaderMaterial({
-      uniforms: Object.assign({}, U, { uHazeDist: { value: L.haze }, uTint: { value: new THREE.Color(...L.tint) } }),
-      vertexShader: MOUNTAIN_VERT, fragmentShader: MOUNTAIN_FRAG, side: THREE.DoubleSide,
-    });
-    const m = new THREE.Mesh(g, mat);
-    m.frustumCulled = false;
-    m.renderOrder = -5;
-    bgScene.add(m);
-    mountainRings.push(m);
-  }
-}
 
 // ---------------------------------------------------------------- environment lighting
 // The sky (plus a bright snowfield below the horizon) captured into a prefiltered PMREM cube:
@@ -1625,13 +1547,17 @@ function applyLight(presetName) {
   U.uSunColor.value.setRGB(tr[0] * L.tint[0] * I, tr[1] * L.tint[1] * I, tr[2] * L.tint[2] * I);
   sun.color.copy(U.uSunColor.value);
   sun.intensity = 1;
-  const k = 0.55 + 0.45 * Math.min(1, Math.sin(el) * 3);
+  // Sky brightness relative to the sun: calibrated so a clear horizon is a little darker than
+  // sunlit snow and the zenith a deep blue (thin air at altitude).
+  const k = (0.55 + 0.45 * Math.min(1, Math.sin(el) * 3)) * 0.55;
   U.uSkyLight.value.setRGB(1.85 * k, 1.95 * k, 2.08 * k);
   U.uHaze.value = 0.018 * L.haze;
-  U.uHazeColor.value.setRGB(0.86 + 0.08 * tr[0], 0.9 + 0.05 * tr[1], 0.98).multiplyScalar(0.8 + 0.25 * k);
-  // snow below the horizon in the environment map: albedo x (sun + sky) irradiance
-  const snowIrr = Math.sin(el + 0.35) * I * 0.9 + 0.55;
-  U.uGroundColor.value.setRGB(0.8 * snowIrr * (0.7 + 0.3 * tr[0]), 0.84 * snowIrr * (0.75 + 0.25 * tr[1]), 0.92 * snowIrr);
+  U.uHazeColor.value.setRGB(0.86 + 0.08 * tr[0], 0.9 + 0.05 * tr[1], 0.98).multiplyScalar(0.62 + 0.35 * k);
+  // Sunlit snowfields below the horizon in the environment map: the radiance of snow lit by the
+  // sun (at ~35 deg incidence) plus the sky, a little less for shaded and forested ground.
+  const sunIn = Math.sin(el + 0.35), sky = 0.33 * (0.55 + 0.45 * Math.min(1, Math.sin(el) * 3));
+  const gr = (i, a) => a * (U.uSunColor.value.toArray()[i] * sunIn + sky * [0.55, 1, 2][i]) * 0.8;
+  U.uGroundColor.value.setRGB(gr(0, 0.86), gr(1, 0.9), gr(2, 0.955));
   updateEnvironment();
 }
 
@@ -1748,15 +1674,11 @@ function renderFrame() {
   if (!post.hdr) {
     renderer.setRenderTarget(null);
     renderer.clear();
-    renderer.render(bgScene, bgCamera);
-    renderer.clearDepth();
     renderer.render(scene, camera);
     return;
   }
   renderer.setRenderTarget(post.rt);
   renderer.clear();
-  renderer.render(bgScene, bgCamera);
-  renderer.clearDepth();
   renderer.render(scene, camera);
   const L = post.levels;
   if (post.bloom) {
@@ -1819,12 +1741,14 @@ function canvasTexture(cv, srgb) {
   return t;
 }
 async function buildTextures(progress) {
-  // fine snow grain: wind-packed crystals and tiny clumps (tile = 1.7 m)
+  // fine snow grain: wind-packed crystals and tiny clumps (tile = 1.6 m)
   TEX.grain = canvasTexture(heightToCanvas(256,
     (u, v) => pfbm(u, v, 18, 18, 3, 101) * 0.6 + pfbm(u, v, 64, 64, 2, 102) * 0.4,
     9, (u, v) => pfbm(u, v, 40, 40, 2, 103)), false);
   progress(0.25); await nextTick();
-  // wind ripples / sastrugi: long, soft ridges across the slope (tile = 17 m) + large-scale albedo
+  // wind ripples / sastrugi: long, soft ridges across the slope (tile = 16 m) + large-scale albedo.
+  // (All tile sizes divide 4096 m, the period at which segment texture coordinates wrap, so the
+  // patterns stay continuous across that wrap and match the far field, which uses world x/z.)
   TEX.wind = canvasTexture(heightToCanvas(512,
     (u, v) => {
       const w = pfbm(u, v, 3, 3, 3, 201);
@@ -1877,7 +1801,7 @@ function hook(src, from, to, what) {
 }
 // World position for fog, the shadow-box fade (so shadows never end in a hard line) and the fog.
 function patchCommon(shader, extraVertPars = '', extraFragPars = '') {
-  for (const k of ['uSunDir', 'uSunColor', 'uSkyLight', 'uSkyBeta', 'uHaze', 'uHazeColor', 'uFogDist', 'uFogEnd', 'uShadowFade', 'uShadowCenter', 'uTime']) shader.uniforms[k] = U[k];
+  for (const k of ['uSunDir', 'uSunColor', 'uSkyLight', 'uSkyBeta', 'uHaze', 'uHazeColor', 'uFogDist', 'uFogEnd', 'uValleyHaze', 'uShadowFade', 'uShadowCenter', 'uTime']) shader.uniforms[k] = U[k];
   let v = shader.vertexShader;
   v = hook(v, '#include <common>', '#include <common>\nvarying vec3 vFW;\n' + extraVertPars, 'v-common');
   v = hook(v, '#include <fog_vertex>', `#include <fog_vertex>
@@ -1940,9 +1864,9 @@ function snowCompile(shader) {
   f = hook(f, '#include <map_fragment>', /* glsl */`
     float flDist = length(vFW - cameraPosition);
     vec3 flN = normalize(vWN);
-    vec4 flGr = texture2D(uGrain, vTC * (1.0 / 1.7));
-    vec4 flWi = texture2D(uWind, vTC * (1.0 / 17.0));
-    vec4 flBig = texture2D(uWind, vTC * (1.0 / 83.0) + 0.37);
+    vec4 flGr = texture2D(uGrain, vTC * (1.0 / 1.6));
+    vec4 flWi = texture2D(uWind, vTC * (1.0 / 16.0));
+    vec4 flBig = texture2D(uWind, (vTC + vFW.y * vec2(0.63, -0.41)) * (1.0 / 64.0) + 0.37);
     float flSlope = 1.0 - flN.y;
     float flRockAmt = smoothstep(0.30, 0.46, flSlope + (flBig.b - 0.5) * 0.2);
     vec3 flRockCol = vec3(0.0);
@@ -1993,9 +1917,52 @@ function snowCompile(shader) {
 }
 // Trees, rocks, gates: standard PBR + shared fog / shadow-fade patch; rocks also get a
 // triplanar granite texture and a snow cap wherever their surface faces up.
+/*
+ * Trees: near-black needles; snow lies where the surface faces up, broken into clumps by 3D value
+ * noise in the tree's own coordinates (so every tree carries its own pattern). The instance colour
+ * is used as data, not a tint: (needle brightness, hue shift, how snow-laden this tree is).
+ */
+const VNOISE3_GLSL = /* glsl */`
+float flH1(float n) { return fract(sin(n) * 43758.5453); }
+float flVN3(vec3 x) {
+  vec3 p = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
+  float n = p.x + p.y * 57.0 + 113.0 * p.z;
+  return mix(mix(mix(flH1(n), flH1(n + 1.0), f.x), mix(flH1(n + 57.0), flH1(n + 58.0), f.x), f.y),
+             mix(mix(flH1(n + 113.0), flH1(n + 114.0), f.x), mix(flH1(n + 170.0), flH1(n + 171.0), f.x), f.y), f.z);
+}
+`;
 function makeTreeMaterial() {
   const m = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.9, metalness: 0 });
-  m.onBeforeCompile = (s) => patchCommon(s);
+  m.onBeforeCompile = (shader) => {
+    const vary = 'varying float vSnowCap;\nvarying vec3 vTreeI;\nvarying vec3 vTN;\nvarying vec3 vTP;\n';
+    patchCommon(shader, 'attribute float aSnow;\n' + vary, vary + VNOISE3_GLSL);
+    let v = shader.vertexShader;
+    v = hook(v, '#include <color_vertex>', `
+      vColor = color;
+      #ifdef USE_INSTANCING_COLOR
+        vTreeI = instanceColor;
+      #else
+        vTreeI = vec3(1.0, 0.5, 0.8);
+      #endif
+      vSnowCap = aSnow;`, 'tree-color');
+    v = hook(v, '#include <begin_vertex>', `#include <begin_vertex>
+      vTP = position;
+      #ifdef USE_INSTANCING
+        vTN = normalize(mat3(modelMatrix) * mat3(instanceMatrix) * objectNormal);
+      #else
+        vTN = normalize(mat3(modelMatrix) * objectNormal);
+      #endif`, 'tree-v');
+    shader.vertexShader = v;
+    let f = shader.fragmentShader;
+    f = hook(f, '#include <color_fragment>', `
+      vec3 flNeedle = vColor * vTreeI.x * mix(vec3(0.85, 1.0, 1.1), vec3(1.2, 1.0, 0.75), vTreeI.y);
+      float flN1 = flVN3(vTP * 36.0 + vTreeI.y * 23.0), flN2 = flVN3(vTP * 105.0 + 7.0);
+      float flSnow = vSnowCap * smoothstep(0.25, 0.75, normalize(vTN).y + (flN1 - 0.5) * 0.95 + (flN2 - 0.5) * 0.35 - (1.0 - vTreeI.z) * 0.45);
+      diffuseColor.rgb = mix(flNeedle, vec3(0.8, 0.84, 0.9), flSnow);
+      float flRough = mix(0.9, 0.72, flSnow);`, 'tree-col');
+    f = hook(f, '#include <roughnessmap_fragment>', 'float roughnessFactor = flRough;', 'tree-rough');
+    shader.fragmentShader = f;
+  };
   m.customProgramCacheKey = () => 'fl-tree';
   return m;
 }
@@ -2070,7 +2037,7 @@ function buildColumns() {
   for (let lod = 0; lod < 3; lod++) {
     const step = TERRAIN.LOD_STEP[lod], cols = [];
     const push = (u) => cols.push(u);
-    const bands = [[TERRAIN.CORE, step], [TERRAIN.MID, step * 3], [TERRAIN.HALF_EXTENT, step * 10]];
+    const bands = [[TERRAIN.CORE, step], [TERRAIN.MID, step * 3.5], [TERRAIN.HALF_EXTENT, step * 12]];
     const half = [];
     let u = 0;
     for (const [limit, st] of bands) while (u < limit - 1e-6) { u = Math.min(u + st, limit); half.push(u); }
@@ -2164,11 +2131,18 @@ function finishBuild(seg) {
   const quads = (R - 1) * (C - 1) + 2 * (C - 1);
   const idx = nv > 65535 ? new Uint32Array(quads * 6) : new Uint16Array(quads * 6);
   let o = 0;
-  for (let r = 0; r < R - 1; r++) {
-    for (let c = 0; c < C - 1; c++) {
-      const a = r * C + c, b = a + 1, d = a + C, e = d + 1;
-      idx[o++] = a; idx[o++] = d; idx[o++] = b; idx[o++] = b; idx[o++] = d; idx[o++] = e;
+  // Quads of the core band (|u| <= CAST_HALF) come first: that part of the index buffer is group 0,
+  // the only part drawn into the sun's shadow map (see makeSegmentMeshes).
+  const core = (c) => Math.abs(J.cols[c]) <= TERRAIN.CAST_HALF && Math.abs(J.cols[c + 1]) <= TERRAIN.CAST_HALF;
+  for (const pass of [true, false]) {
+    for (let r = 0; r < R - 1; r++) {
+      for (let c = 0; c < C - 1; c++) {
+        if (core(c) !== pass) continue;
+        const a = r * C + c, b = a + 1, d = a + C, e = d + 1;
+        idx[o++] = a; idx[o++] = d; idx[o++] = b; idx[o++] = b; idx[o++] = d; idx[o++] = e;
+      }
     }
+    if (pass) seg.coreCount = o;
   }
   for (let c = 0; c < C - 1; c++) {                          // front skirt (faces uphill) and back skirt
     const t0 = c, t1 = c + 1, s0 = R * C + c, s1 = s0 + 1;
@@ -2181,26 +2155,41 @@ function finishBuild(seg) {
   g.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
   g.setAttribute('aSnow', new THREE.BufferAttribute(snow, 4));
   g.setIndex(new THREE.BufferAttribute(idx, 1));
+  g.addGroup(0, seg.coreCount, 0);
+  g.addGroup(seg.coreCount, idx.length - seg.coreCount, 1);
   g.computeBoundingSphere();
   if (!seg.material) {
     seg.material = makeSnowMaterial();
     seg.material.userData.uTexOrigin.value.set(0, ((seg.z0 % 4096) + 4096) % 4096);
   }
-  if (seg.mesh) { seg.mesh.geometry.dispose(); seg.mesh.geometry = g; }
-  else {
-    seg.mesh = new THREE.Mesh(g, seg.material);
-    seg.mesh.position.set(0, 0, seg.z0);
-    seg.mesh.matrixAutoUpdate = false;
-    seg.mesh.updateMatrix();
-    seg.mesh.receiveShadow = true;
-    world.group.add(seg.mesh);
-  }
+  if (seg.mesh) { seg.mesh.geometry.dispose(); seg.mesh.geometry = g; seg.caster.geometry = g; }
+  else makeSegmentMeshes(seg, g);
   seg.lod = J.lod;
   seg.job = null;
 }
+/*
+ * Each segment is drawn by one mesh and casts shadows through a second mesh that shares the same
+ * geometry but renders only group 0 (the band within TERRAIN.CAST_HALF of the run) and only into
+ * the shadow map (layer 1, which the sun's shadow camera sees and the main camera does not).
+ * Moguls, lips and cliffs shade themselves; the kilometre-wide valley walls do not throw a shadow
+ * that would exist only inside the skier's small shadow box.
+ */
+const HIDDEN_MAT = new THREE.MeshBasicMaterial({ visible: false });
+function makeSegmentMeshes(seg, g) {
+  seg.mesh = new THREE.Mesh(g, seg.material);             // single material: groups ignored, one draw
+  seg.caster = new THREE.Mesh(g, [seg.material, HIDDEN_MAT]);
+  for (const m of [seg.mesh, seg.caster]) {
+    m.position.set(0, 0, seg.z0);
+    m.matrixAutoUpdate = false;
+    m.updateMatrix();
+    world.group.add(m);
+  }
+  seg.mesh.receiveShadow = true;
+  seg.caster.layers.set(1);
+}
 function disposeSegment(seg) {
   if (seg.mesh) {
-    world.group.remove(seg.mesh);
+    world.group.remove(seg.mesh); world.group.remove(seg.caster); seg.caster = null;
     seg.mesh.geometry.dispose();                             // free GPU buffers...
     seg.material.dispose();                                  // ...and this segment's material
     seg.mesh = null; seg.material = null;
@@ -2238,13 +2227,275 @@ function updateStreaming(pz, budgetMs) {
     else break;
   }
   // shadows: only terrain close to the skier casts (mogul and cliff self-shadowing)
-  for (const seg of world.segments.values()) if (seg.mesh) seg.mesh.castShadow = seg.z1 > pz - 40 && seg.z0 < pz + 110;
+  for (const seg of world.segments.values()) if (seg.caster) seg.caster.castShadow = seg.z1 > pz - 40 && seg.z0 < pz + 110;
 }
 function resetWorld(seed) {
   for (const seg of [...world.segments.values()]) disposeSegment(seg);
   world.jobs.length = 0;
   world.course = new Course(seed);
   world.instancesDirty = true; world.gatesDirty = true;
+  resetFarField(world.course);
+}
+// =====================================================================================
+// SECTION 8b — FAR FIELD  (valley walls and mountain ranges beyond the streamed strip)
+// =====================================================================================
+/*
+ * Everything beyond the detailed strip is ONE height-field mesh in world space.
+ *  - Shape: close to the run it is exactly the strip's own macro surface (same cross-section,
+ *    rolls and side ridges, from the same course profile), so strip and far field meet without a
+ *    seam. From ~0.4 to ~1.2 km out it blends into real mountains: valley walls that level off
+ *    ~2.6 km above the valley floor, carved into crests, spurs and gullies by domain-warped
+ *    ridged noise.
+ *  - Streaming: rows are FAR.ROW (50 m) apart along z and anchored in the world. They live in a
+ *    ring buffer: when the camera has moved one row downhill, the row that fell FAR.BEHIND behind
+ *    is recomputed as the new row FAR.AHEAD in front (a few hundred height samples, well under a
+ *    millisecond) and only that part of the vertex buffers is re-uploaded. Nothing is ever
+ *    re-tessellated, so distant geometry never pops. Columns follow the course centre with a
+ *    spacing that grows with distance (10 m at the run, ~400 m at 12 km out).
+ *  - The vertex shader does two camera-relative things. (1) Where the detailed strip covers the
+ *    far field it sinks it out of sight, so the two never z-fight. (2) The run descends forever,
+ *    so a strictly world-fixed valley would drop out of view ahead; beyond ~6 km the landscape is
+ *    gradually re-based on a floor tied to the camera's height, and a range of peaks rises across
+ *    the valley far ahead. Both shifts are continuous in the camera position, so the far ranges
+ *    simply keep their place on the horizon as you ski.
+ *  - Shading: the same PBR sun + sky light and the same aerial perspective as the strip. Snow,
+ *    rock on faces too steep to hold snow, dark snowy forest below a tree line; near the run the
+ *    forest follows the density of the real, modelled trees so tree lines continue past the strip.
+ */
+const farField = {
+  mesh: null, geo: null, mat: null, course: null, noise: null,
+  cols: null, R: 0, C: 0, rowMin: 0, valid: false, dirtyA: -1, dirtyB: -1,
+  uStrip: { value: new THREE.Vector2(0, 0) },
+};
+const _fp = {};
+
+function initFarField() {
+  const F = farField;
+  const J = Math.ceil(Math.log(1 + FAR.HALF * FAR.K / FAR.S0) / FAR.K);
+  F.C = 2 * J + 1;
+  F.cols = new Float32Array(F.C);
+  for (let j = -J; j <= J; j++) F.cols[j + J] = Math.sign(j) * (FAR.S0 / FAR.K) * (Math.exp(FAR.K * Math.abs(j)) - 1);
+  F.R = Math.round((FAR.BEHIND + FAR.AHEAD) / FAR.ROW) + 1;
+  const n = F.R * F.C;
+  const g = new THREE.BufferGeometry();
+  const attr = (k, size) => { const a = new THREE.BufferAttribute(new Float32Array(n * size), size); a.setUsage(THREE.DynamicDrawUsage); g.setAttribute(k, a); return a; };
+  attr('position', 3); attr('normal', 3); attr('aFar', 4); attr('aRange', 3);
+  // Static index buffer: quads between ring slots k and k+1 (mod R). The pair that joins the
+  // newest row to the oldest one is the ring's seam and is left out via draw groups.
+  const idx = new Uint32Array(F.R * (F.C - 1) * 6);
+  let o = 0;
+  for (let k = 0; k < F.R; k++) {
+    const k1 = (k + 1) % F.R;
+    for (let c = 0; c < F.C - 1; c++) {
+      const a = k * F.C + c, b = a + 1, d = k1 * F.C + c, e = d + 1;
+      idx[o++] = a; idx[o++] = d; idx[o++] = b; idx[o++] = b; idx[o++] = d; idx[o++] = e;
+    }
+  }
+  g.setIndex(new THREE.BufferAttribute(idx, 1));
+  F.geo = g;
+  F.mat = makeFarMaterial();
+  F.mesh = new THREE.Mesh(g, [F.mat]);
+  F.mesh.frustumCulled = false;
+  F.mesh.matrixAutoUpdate = false;
+  F.mesh.renderOrder = 50;                         // after the strip: early-z skips hidden pixels
+  scene.add(F.mesh);
+}
+
+// Course profile at z; uphill of where the profile starts, the valley keeps climbing.
+function farProfile(z) {
+  const c = farField.course, zs = c.z0 + 2;
+  if (z >= zs) return c.sample(z, _fp);
+  c.sample(zs, _fp);
+  _fp.alt += (zs - z) * 0.3; _fp.bucket = null; _fp.mogul = 0;
+  return _fp;
+}
+function farHeight(x, z, p) {
+  const N = farField.noise;
+  const a = Math.abs(x - p.center), e = Math.max(a - p.halfW, 0);
+  const w = smoothstep(430, 1000, a);
+  let h = w < 1 ? farField.course.heightP(x, z, p, false) : 0;
+  if (w > 0) {
+    const qx = x * 0.00034, qz = z * 0.00034;
+    const wx = qx + 0.6 * N.warpA.noise(qx * 0.45 + 3.1, qz * 0.45);
+    const wz = qz + 0.6 * N.warpB.noise(qx * 0.45 - 7.7, qz * 0.45 + 1.3);
+    const ridge = N.mtn.ridged(wx, wz, 6);
+    const walls = 2200 * (1 - Math.exp(-e / 3200));
+    h = lerp(h, p.alt + walls + 1800 * smoothstep(150, 4000, e) * (ridge - 0.33), w);
+  }
+  return h;
+}
+// Canopy cover of the modelled trees (mirrors the densities in populateSegment), so tree lines
+// carry on as dark bands where the detailed strip ends.
+function farCover(x, z, p) {
+  const course = farField.course, a = Math.abs(x - p.center), hw = p.halfW;
+  let c;
+  if (a < hw - 3) c = z < 40 ? 0 : p.treeIn * 1.4;
+  else if (a < hw + 14) c = z < 20 ? 0.1 : p.treeEdge * 1.4;
+  else if (a < hw + 34) c = 0.84 * course.forestDensity(x, z);
+  else if (a < hw + 144) c = 0.4 * course.forestDensity(x, z);
+  else c = 0;
+  return clamp(c, 0, 1);
+}
+// A range of peaks across the valley far ahead (only raised by the vertex shader at 8+ km).
+function farRange(x, z, u) {
+  const r = farField.noise.range.ridged(x * 0.00021 + 5.3, z * 0.00021 - 2.9, 4);
+  return 2600 * Math.pow(r, 1.4) * (1 - 0.6 * smoothstep(500, 4000, Math.abs(u)));
+}
+const slotOf = (w) => ((w % farField.R) + farField.R) % farField.R;
+function farComputeRow(w) {
+  const F = farField, C = F.C, z = w * FAR.ROW, p = farProfile(z);
+  const base = slotOf(w) * C;
+  const pos = F.geo.attributes.position.array, info = F.geo.attributes.aFar.array, rng = F.geo.attributes.aRange.array;
+  for (let j = 0; j < C; j++) {
+    const u = F.cols[j], x = p.center + u, i = base + j;
+    pos[i * 3] = x; pos[i * 3 + 1] = farHeight(x, z, p); pos[i * 3 + 2] = z;
+    info[i * 4] = Math.abs(u); info[i * 4 + 1] = Math.abs(u) - p.halfW; info[i * 4 + 2] = p.alt; info[i * 4 + 3] = farCover(x, z, p);
+    rng[i * 3] = farRange(x, z, u);
+  }
+}
+// Normals and range gradients from the grid itself (central differences where both neighbours
+// exist), so shading matches the triangles that are actually drawn.
+function farNormals(w) {
+  const F = farField, C = F.C, pos = F.geo.attributes.position.array, nrm = F.geo.attributes.normal.array, rng = F.geo.attributes.aRange.array;
+  const wa = Math.max(w - 1, F.rowMin), wb = Math.min(w + 1, F.rowMin + F.R - 1);
+  const s = slotOf(w) * C, sa = slotOf(wa) * C, sb = slotOf(wb) * C;
+  for (let j = 0; j < C; j++) {
+    const jl = Math.max(j - 1, 0), jr = Math.min(j + 1, C - 1);
+    const L = s + jl, Rr = s + jr, A = sa + j, B = sb + j;
+    const ax = pos[Rr * 3] - pos[L * 3], ay = pos[Rr * 3 + 1] - pos[L * 3 + 1], az = pos[Rr * 3 + 2] - pos[L * 3 + 2];
+    const bx = pos[B * 3] - pos[A * 3], by = pos[B * 3 + 1] - pos[A * 3 + 1], bz = pos[B * 3 + 2] - pos[A * 3 + 2];
+    let nx = by * az - bz * ay, ny = bz * ax - bx * az, nz = bx * ay - by * ax;
+    const l = Math.hypot(nx, ny, nz) || 1;
+    const i = s + j;
+    nrm[i * 3] = nx / l; nrm[i * 3 + 1] = ny / l; nrm[i * 3 + 2] = nz / l;
+    // d(range)/dx and d(range)/dz for the shader's normal correction
+    const dxr = ax * ax + az * az > 1e-6 ? (rng[Rr * 3] - rng[L * 3]) / ax : 0;
+    const dzr = bz > 1e-6 ? (rng[B * 3] - rng[A * 3]) / bz : 0;
+    rng[i * 3 + 1] = dxr; rng[i * 3 + 2] = dzr;
+  }
+}
+function farMarkDirty(w) {
+  const s = slotOf(w), F = farField;
+  if (F.dirtyA < 0) { F.dirtyA = F.dirtyB = s; return; }
+  F.dirtyA = Math.min(F.dirtyA, s); F.dirtyB = Math.max(F.dirtyB, s);
+}
+function farUpload() {
+  const F = farField;
+  if (F.dirtyA < 0) return;
+  const C = F.C;
+  for (const [k, size] of [['position', 3], ['normal', 3], ['aFar', 4], ['aRange', 3]]) {
+    const a = F.geo.attributes[k];
+    a.updateRange.offset = F.dirtyA * C * size;
+    a.updateRange.count = (F.dirtyB - F.dirtyA + 1) * C * size;
+    a.needsUpdate = true;
+  }
+  F.dirtyA = F.dirtyB = -1;
+  // draw everything except the seam pair (newest row -> oldest row)
+  const seam = slotOf(F.rowMin + F.R - 1), per = (C - 1) * 6;
+  F.geo.clearGroups();
+  if (seam > 0) F.geo.addGroup(0, seam * per, 0);
+  if (seam < F.R - 1) F.geo.addGroup((seam + 1) * per, (F.R - seam - 1) * per, 0);
+}
+function farRebuild(rowMin) {
+  const F = farField;
+  F.rowMin = rowMin;
+  for (let w = rowMin; w < rowMin + F.R; w++) farComputeRow(w);
+  for (let w = rowMin; w < rowMin + F.R; w++) farNormals(w);
+  F.dirtyA = 0; F.dirtyB = F.R - 1;
+  F.valid = true;
+  farUpload();
+}
+function resetFarField(course) {
+  const F = farField;
+  F.course = course;
+  const rng = mulberry32(course.seed ^ 0x51ED270B);
+  F.noise = { warpA: new Simplex2D(rng), warpB: new Simplex2D(rng), mtn: new Simplex2D(rng), range: new Simplex2D(rng) };
+  F.valid = false;
+}
+// Per frame: advance the ring (bounded work per frame) and tell the shader where the strip is.
+function updateFarField(cz, budgetMs) {
+  const F = farField;
+  const want = Math.floor((cz - FAR.BEHIND) / FAR.ROW);
+  if (!F.valid || Math.abs(want - F.rowMin) > F.R / 2) farRebuild(want);
+  const t0 = performance.now();
+  let n = 0;
+  while (F.rowMin < want && (n < 2 || performance.now() - t0 < budgetMs)) {
+    const w = F.rowMin + F.R;
+    farComputeRow(w);
+    F.rowMin++;
+    farNormals(w - 1); farNormals(w);
+    farMarkDirty(w - 1); farMarkDirty(w);
+    n++;
+  }
+  farUpload();
+  // contiguous built part of the strip around the skier (nothing is sunk if there is none)
+  const i0 = Math.floor(skier.pos.z / TERRAIN.SEG_LEN);
+  let a = 0, b = 0, s;
+  for (let i = i0; (s = world.segments.get(i)) && s.mesh; i++) b = s.z1;
+  for (let i = i0; (s = world.segments.get(i)) && s.mesh; i--) a = s.z0;
+  F.uStrip.value.set(a, Math.max(a, b));
+}
+
+/*
+ * Far-field material: MeshStandardMaterial (same sun + sky IBL as the strip) with the snow,
+ * rock and forest masks computed exactly like the strip's snow shader wherever they overlap.
+ */
+function makeFarMaterial() {
+  const m = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.7, metalness: 0 });
+  m.onBeforeCompile = (shader) => {
+    shader.uniforms.uStrip = farField.uStrip;
+    shader.uniforms.uGrain = { value: TEX.grain };
+    shader.uniforms.uWind = { value: TEX.wind };
+    patchCommon(shader,
+      `attribute vec4 aFar;\nattribute vec3 aRange;\nuniform vec2 uStrip;\nvarying vec3 vFar;\nvarying vec3 vFarN;\n`,
+      `uniform sampler2D uGrain;\nuniform sampler2D uWind;\nvarying vec3 vFar;\nvarying vec3 vFarN;\n`);
+    let v = shader.vertexShader;
+    v = hook(v, '#include <beginnormal_vertex>', /* glsl */`#include <beginnormal_vertex>
+      float flDz = position.z - cameraPosition.z;
+      float flS1 = smoothstep(6000.0, 13000.0, flDz);            // re-base far terrain on a camera-relative floor
+      float flS2 = smoothstep(8500.0, 14000.0, flDz);            // raise the range across the valley
+      {
+        vec2 g = -objectNormal.xz / max(objectNormal.y, 0.05) + flS2 * aRange.yz;
+        objectNormal = normalize(vec3(-g.x, 1.0, -g.y));
+      }
+      vFarN = objectNormal;`, 'far-n');
+    v = hook(v, '#include <begin_vertex>', /* glsl */`#include <begin_vertex>
+      float flIn = (1.0 - smoothstep(${(TERRAIN.HALF_EXTENT - 40).toFixed(1)}, ${(TERRAIN.HALF_EXTENT - 4).toFixed(1)}, aFar.x))
+                 * smoothstep(uStrip.x + 4.0, uStrip.x + 44.0, position.z) * (1.0 - smoothstep(uStrip.y - 44.0, uStrip.y - 4.0, position.z));
+      transformed.y -= ${FAR.SINK.toFixed(1)} * flIn;
+      transformed.y += flS1 * max(cameraPosition.y - 1400.0 - aFar.z, 0.0) + flS2 * aRange.x;
+      vFar = vec3(aFar.y, position.y - aFar.z, aFar.w);`, 'far-v');
+    shader.vertexShader = v;
+    let f = shader.fragmentShader;
+    f = hook(f, '#include <map_fragment>', /* glsl */`
+      vec3 flN = normalize(vFarN);
+      // same lookups as the strip's snow shader (world x/z; tiles divide its 4096 m wrap), with a
+      // height offset on the large patterns so they don't smear into vertical streaks on steep faces
+      vec2 flTC = vFW.xz + vFW.y * vec2(0.63, -0.41);
+      vec4 flWi = texture2D(uWind, vFW.xz * (1.0 / 16.0));
+      vec4 flBig = texture2D(uWind, flTC * (1.0 / 64.0) + 0.37);
+      vec4 flHuge = texture2D(uWind, flTC * (1.0 / 2048.0) + 0.61);
+      float flGrB = texture2D(uGrain, vFW.xz * (1.0 / 1.6)).b;
+      float flRockAmt = smoothstep(0.30, 0.46, (1.0 - flN.y) + (flBig.b - 0.5) * 0.2 + (flHuge.b - 0.5) * 0.12);
+      vec3 flAlb = vec3(0.86, 0.9, 0.955) * (0.94 + 0.09 * flBig.b);
+      // painted forest exactly as on the strip's valley walls, the modelled trees' cover near the
+      // run, and a ragged tree line ~${FAR.TREELINE} m above the valley floor
+      float flPaint = smoothstep(118.0, 150.0, vFar.x) * smoothstep(0.38, 0.62, flBig.b + 0.3 * (flWi.b - 0.5));
+      float flTreeLine = 1.0 - smoothstep(${(FAR.TREELINE - 160).toFixed(1)}, ${(FAR.TREELINE + 160).toFixed(1)}, vFar.y + (flHuge.g - 0.5) * 500.0);
+      float flForest = max(flPaint, vFar.z) * flTreeLine * (1.0 - flRockAmt);
+      vec3 flForestCol = mix(vec3(0.02, 0.04, 0.028), vec3(0.6, 0.64, 0.7), smoothstep(0.5, 0.78, flGrB));
+      vec3 flRockCol = vec3(0.105, 0.098, 0.092) * (0.75 + 0.5 * flHuge.r);
+      flAlb = mix(flAlb, flRockCol, flRockAmt);
+      flAlb = mix(flAlb, flForestCol, flForest);
+      diffuseColor.rgb = flAlb;
+      float flRough = mix(0.68, 0.84, max(flRockAmt, flForest));
+    `, 'far-map');
+    f = hook(f, '#include <roughnessmap_fragment>', 'float roughnessFactor = flRough;', 'far-rough');
+    f = hook(f, '#include <metalnessmap_fragment>', 'float metalnessFactor = 0.0;', 'far-metal');
+    shader.fragmentShader = f;
+  };
+  m.customProgramCacheKey = () => 'fl-far';
+  return m;
 }
 
 // =====================================================================================
@@ -2260,61 +2511,66 @@ function resetWorld(seed) {
  * enough to shift the tiers. Pools have fixed capacities, so nothing accumulates.
  */
 const POOLS = { treeNear: [], treeMid: [], treeFar: null, rockNear: [], rockFar: [], pole: null, flag: null };
-const TREE_COLORS = { bark: [0.05, 0.036, 0.026], needle: [0.014, 0.036, 0.02], needleLight: [0.03, 0.06, 0.03], snow: [0.72, 0.76, 0.82] };
+const TREE_COLORS = { bark: [0.034, 0.029, 0.026], needle: [0.012, 0.032, 0.018], needleLight: [0.026, 0.052, 0.03], needleDark: [0.006, 0.016, 0.01] };
+const mixc = (a, b, t) => [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
 
-// Conifer: tapered trunk + drooping, star-edged tiers (branch clumps), snow on the upper sides.
-function makeTreeGeometry(seed, tiers, width, snow, lowPoly) {
+/*
+ * Snowy conifer (spruce / fir) at unit height; instances scale it. A tapered trunk and whorls of
+ * drooping branches. Each whorl is a star of alternating long and short branches (the ragged
+ * silhouette) with a convex upper surface (trunk -> shoulder -> drooping tips) and a separate dark
+ * underside. Per vertex: needle colour, and aSnow = how much snow that spot can hold (a lot on the
+ * shoulders, a little on the tips, none underneath). Where snow actually lies is decided per pixel
+ * in the tree shader (surface facing up + clumpy noise), see makeTreeMaterial.
+ */
+function makeTreeGeometry(seed, tiers, spokes, width, underside) {
   const rnd = mulberry32(seed);
-  const P = [], N = [], C = [], I = [];
-  const v = (x, y, z, nx, ny, nz, c) => { P.push(x, y, z); N.push(nx, ny, nz); C.push(c[0], c[1], c[2]); return P.length / 3 - 1; };
-  const mixc = (a, b, t) => [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
-  const sides = lowPoly ? 5 : 7;
-  // trunk (unit height; instances scale it)
+  const P = [], C = [], S = [], I = [];
+  const v = (x, y, z, c, snow) => { P.push(x, y, z); C.push(c[0], c[1], c[2]); S.push(snow); return P.length / 3 - 1; };
+  const sides = underside ? 6 : 4;
   const t0 = P.length / 3;
   for (let i = 0; i <= sides; i++) {
     const a = (i / sides) * Math.PI * 2, c = Math.cos(a), s = Math.sin(a);
-    v(c * 0.024, -0.05, s * 0.024, c, 0, s, TREE_COLORS.bark);
-    v(c * 0.006, 0.9, s * 0.006, c, 0, s, TREE_COLORS.bark);
+    v(c * 0.022, -0.05, s * 0.022, TREE_COLORS.bark, 0);
+    v(c * 0.005, 0.9, s * 0.005, TREE_COLORS.bark, 0);
   }
   for (let i = 0; i < sides; i++) { const a = t0 + i * 2; I.push(a, a + 1, a + 2, a + 1, a + 3, a + 2); }
-  const n = lowPoly ? 6 : 11;
-  const T = lowPoly ? 3 : tiers;
-  for (let t = 0; t < T; t++) {
-    const f = t / T;
-    const apexY = lerp(0.24, 1.02, (t + 1) / T) + (rnd() - 0.5) * 0.02;
-    const radius = width * Math.pow(1 - f, 0.85) * (0.88 + 0.24 * rnd()) + 0.025;
-    const droop = radius * (0.62 + 0.25 * rnd());
-    const rimY = apexY - droop;
-    const tierSnow = snow * (0.55 + 0.45 * rnd()) * (0.6 + 0.4 * (1 - f));
-    const apexC = mixc(TREE_COLORS.needle, TREE_COLORS.snow, tierSnow * 0.7);
-    const apex = v(0, apexY, 0, 0, 1, 0, apexC);
-    const rim = [], under = [];
+  const n = spokes * 2;
+  for (let t = 0; t < tiers; t++) {
+    const f = t / tiers;
+    const apexY = lerp(0.13, 1.0, (t + 1) / tiers) + (rnd() - 0.5) * 0.015;
+    const R = width * Math.pow(1 - f, 0.85) * (0.86 + 0.28 * rnd()) + 0.018;
+    const D = R * (0.6 + 0.35 * rnd());                  // how far the tips hang below the whorl top
     const phase = rnd() * Math.PI * 2;
+    const needle = mixc(TREE_COLORS.needle, TREE_COLORS.needleLight, rnd() * 0.7);
+    const apex = v(0, apexY, 0, needle, 1);
+    const mid = [], rimU = [], rimL = [], und = [];
     for (let k = 0; k < n; k++) {
-      const a = phase + (k / n) * Math.PI * 2 + (rnd() - 0.5) * 0.25;
-      const star = lowPoly ? 1 : (k % 2 ? 0.74 : 1.0);
-      const r = radius * star * (0.9 + 0.2 * rnd());
+      const long = k % 2 === 0;
+      const a = phase + (k / n) * Math.PI * 2 + (rnd() - 0.5) * (Math.PI / n) * 0.8;
       const ca = Math.cos(a), sa = Math.sin(a);
-      const y = rimY + (rnd() - 0.5) * 0.02 * (1 + droop * 4);
-      const slope = (apexY - y) / Math.max(r, 1e-3);
-      const nl = Math.hypot(slope, 1);
-      const snowy = rnd() < 0.8 ? tierSnow : tierSnow * 0.3;
-      const col = mixc(mixc(TREE_COLORS.needle, TREE_COLORS.needleLight, rnd() * 0.6), TREE_COLORS.snow, snowy);
-      rim.push(v(ca * r, y, sa * r, ca * slope / nl, 1 / nl, sa * slope / nl, col));
-      under.push(v(ca * r * 0.42, y - droop * 0.28, sa * r * 0.42, ca * 0.35, -1, sa * 0.35, [TREE_COLORS.needle[0] * 0.55, TREE_COLORS.needle[1] * 0.55, TREE_COLORS.needle[2] * 0.55]));
+      const r = R * (long ? 1 : 0.56) * (0.84 + 0.32 * rnd());
+      const tipY = apexY - D * (long ? 1 : 0.7) * (0.85 + 0.3 * rnd());
+      const c = mixc(needle, TREE_COLORS.needleLight, rnd() * 0.5);
+      mid.push(v(ca * r * 0.5, apexY - D * 0.28, sa * r * 0.5, c, long ? 0.95 : 0.8));
+      rimU.push(v(ca * r, tipY, sa * r, c, long ? 0.3 : 0.55));
+      if (underside) {
+        rimL.push(v(ca * r, tipY, sa * r, TREE_COLORS.needleDark, 0));
+        und.push(v(ca * r * 0.4, tipY - D * 0.22 - 0.01, sa * r * 0.4, TREE_COLORS.needleDark, 0));
+      }
     }
     for (let k = 0; k < n; k++) {
       const k1 = (k + 1) % n;
-      I.push(apex, rim[k1], rim[k]);                        // upper surface (seen from above/outside)
-      I.push(rim[k], rim[k1], under[k]);                    // underside skirt
-      I.push(rim[k1], under[k1], under[k]);
+      I.push(apex, mid[k1], mid[k]);                              // upper surface
+      I.push(mid[k], mid[k1], rimU[k], mid[k1], rimU[k1], rimU[k]);
+      if (underside) I.push(rimL[k], rimL[k1], und[k], rimL[k1], und[k1], und[k]);   // underside
     }
   }
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.Float32BufferAttribute(P, 3));
-  g.setAttribute('normal', new THREE.Float32BufferAttribute(N, 3));
   g.setAttribute('color', new THREE.Float32BufferAttribute(C, 3));
+  g.setAttribute('aSnow', new THREE.Float32BufferAttribute(S, 1));
   g.setIndex(I);
+  g.computeVertexNormals();
   g.computeBoundingSphere();
   return g;
 }
@@ -2343,13 +2599,13 @@ function makePool(geo, mat, capacity, castShadow) {
 }
 function initPools() {
   const treeMat = makeTreeMaterial(), rockMat = makeRockMaterial();
-  const variants = [[7, 0.3, 0.55, 5], [6, 0.36, 0.8, 7], [8, 0.27, 0.35, 9]];
-  variants.forEach(([tiers, width, snow, seed]) => {
-    const g = makeTreeGeometry(seed, tiers, width, snow, false);
-    POOLS.treeNear.push(makePool(g, treeMat, 1400, true));
-    POOLS.treeMid.push(makePool(g, treeMat, 2600, false));
+  // three species-ish variants: slender spruce, fuller fir, tall narrow spruce
+  const variants = [[10, 0.2, 5], [9, 0.24, 7], [11, 0.18, 9]];
+  variants.forEach(([tiers, width, seed]) => {
+    POOLS.treeNear.push(makePool(makeTreeGeometry(seed, tiers, 7, width, true), treeMat, 1400, true));
+    POOLS.treeMid.push(makePool(makeTreeGeometry(seed, Math.ceil(tiers * 0.6), 4, width, false), treeMat, 2600, false));
   });
-  POOLS.treeFar = makePool(makeTreeGeometry(3, 3, 0.32, 0.6, true), treeMat, 9000, false);
+  POOLS.treeFar = makePool(makeTreeGeometry(3, 3, 3, 0.21, false), treeMat, 9000, false);
   for (let i = 0; i < 3; i++) {
     const g = makeRockGeometry(i + 1);
     POOLS.rockNear.push(makePool(g, rockMat, 700, true));
@@ -2372,7 +2628,7 @@ function rebuildInstances(px, pz) {
     for (const t of seg.trees) {
       const dz = t.z - pz, dx = Math.abs(t.x - px);
       if (dz < -70) continue;
-      const tier = dz < 150 && dx < 110 ? 0 : dz < 360 && dx < 190 ? 1 : 2;
+      const tier = dz < PERF.treeNear && dx < 110 ? 0 : dz < 360 && dx < 190 ? 1 : 2;
       let pool, i;
       if (tier === 0) { pool = POOLS.treeNear[t.variant]; i = tn[t.variant]++; }
       else if (tier === 1) { pool = POOLS.treeMid[t.variant]; i = tm[t.variant]++; }
@@ -2381,7 +2637,8 @@ function rebuildInstances(px, pz) {
       _q.setFromAxisAngle(_yAxis, t.rot);
       _m4.compose(_ps.set(t.x, t.y, t.z), _q, _sc.set(t.height * (0.94 + 0.12 * t.tint), t.height, t.height * (0.94 + 0.12 * (1 - t.tint))));
       pool.setMatrixAt(i, _m4);
-      pool.setColorAt(i, _col.setRGB(0.85 + 0.25 * t.tint, 0.9 + 0.18 * t.tint, 0.88 + 0.12 * (1 - t.tint)));
+      // per-instance: needle brightness, hue shift, how snow-laden this tree is
+      pool.setColorAt(i, _col.setRGB(0.8 + 0.4 * t.tint, hash3f(t.x, t.z, 7), 0.45 + 0.55 * hash3f(t.z, t.x, 11)));
     }
     for (const r of seg.rocks) {
       const dz = r.z - pz;
@@ -2880,12 +3137,7 @@ function updateTitleCamera(dt) {
   camera.lookAt(CAM.look);
 }
 function syncBackground() {
-  bgCamera.position.copy(camera.position);
-  bgCamera.quaternion.copy(camera.quaternion);
-  if (bgCamera.fov !== camera.fov || bgCamera.aspect !== camera.aspect) { bgCamera.fov = camera.fov; bgCamera.aspect = camera.aspect; bgCamera.updateProjectionMatrix(); }
-  skyDome.position.copy(camera.position);
-  // the distant ranges follow you sideways; as you descend they seem to rise (partial follow in y)
-  for (const m of mountainRings) m.position.set(camera.position.x, camera.position.y * 0.55 - 40, camera.position.z);
+  skyDome.position.copy(camera.position);            // the sky is infinitely far away
 }
 // Sun & shadow box follow the skier (snapped to shadow-map texels to avoid shimmering).
 const _sx = new THREE.Vector3(), _sy = new THREE.Vector3(), _sc2 = new THREE.Vector3();
@@ -3123,7 +3375,7 @@ const UI = {
 // =====================================================================================
 // SECTION 15 — GAME STATE & MAIN LOOP
 // =====================================================================================
-const PERF = { ema: 16, level: 0, cooldown: 4 };
+const PERF = { ema: 16, level: 0, cooldown: 4, treeNear: 150 };
 // Performance governor: when frames get slow, cut the optional fidelity first (speed blur,
 // bloom, pixel ratio, shadow resolution) instead of letting the game stutter.
 function applyQuality(level) {
@@ -3134,6 +3386,8 @@ function applyQuality(level) {
   post.bloom = level < 2;
   U.uSparkle.value = level < 2 ? 1 : 0.7;
   setShadowSize(level < 2 ? 2048 : 1024);
+  PERF.treeNear = [150, 100, 65][level];                      // distance of full-detail, shadow-casting trees
+  world.instancesDirty = true;
   onResize();
 }
 function perfUpdate(dt) {
@@ -3281,9 +3535,11 @@ function frame(now) {
   if (sprayLitTimer <= 0) { sprayLitTimer = 0.12; sprayLit = skierInSun(); }
   // skier pose, camera, sun, background
   poseSkier(dt, renderPos, rpsi);
-  if (st === 'title' || st === 'boot') updateTitleCamera(dt);
+  if (FREELINE.debugCam) { camera.position.fromArray(FREELINE.debugCam.pos); camera.lookAt(_ahead.fromArray(FREELINE.debugCam.look)); }
+  else if (st === 'title' || st === 'boot') updateTitleCamera(dt);
   else updateCamera(dt, renderPos);
   syncBackground();
+  updateFarField(camera.position.z, 1.5);
   _ahead.copy(renderPos).addScaledVector(CAM.dir, 26);
   updateSun(_ahead);
   SPRAY.points.material.uniforms.uNow.value = simTime + (st === 'running' ? acc : 0);
@@ -3306,13 +3562,14 @@ async function boot() {
   buildColumns();
   status('Painting snow, rock and sky textures…');
   await buildTextures((p) => status(`Painting snow, rock and sky textures… ${Math.round(p * 100)}%`));
-  initPools(); initSpray(); initTracks(); buildSkier();
+  initPools(); initSpray(); initTracks(); buildSkier(); initFarField();
   scene.add(world.group);
   applyLight(Game.light);
   initInput(); UI.init();
   status('Shaping the mountain…');
   await nextTick();
-  await Game.newRun(randomSeed());
+  const seedParam = parseInt(new URLSearchParams(location.search).get('seed'), 10);   // ?seed=N replays a course
+  await Game.newRun(seedParam >= 0 ? seedParam >>> 0 : randomSeed());
   onResize();
   Game.state = 'title';
   status('');
@@ -3327,7 +3584,7 @@ function fatal(html) {
   $('start-btn').textContent = 'Unavailable';
 }
 // Small hook for automated tests / console tinkering.
-window.FREELINE = { Game, skier, run, world, input, PHYS, TERRAIN, VISUAL, U, post, PERF, physicsStep, applyLight, applyQuality, get renderer() { return renderer; }, get camera() { return camera; } };
+const FREELINE = window.FREELINE = { debugCam: null, farField, Game, skier, run, world, input, PHYS, TERRAIN, VISUAL, U, post, PERF, physicsStep, applyLight, applyQuality, get renderer() { return renderer; }, get camera() { return camera; } };
 boot().catch((err) => { console.error(err); fatal('Something went wrong while starting.<br><small>' + String(err && err.message || err) + '</small>'); });
 
 })();
