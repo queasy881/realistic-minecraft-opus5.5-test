@@ -70,8 +70,9 @@
   #lives i { display: inline-block; width: 11px; height: 11px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 8px rgba(255, 207, 92, 0.7); }
   #lives i.lost { background: rgba(255,255,255,0.15); box-shadow: none; }
   #hud-gates { background: var(--panel); border: 1px solid var(--line); padding: 7px 10px; border-radius: 10px; font-size: 13px; font-variant-numeric: tabular-nums; }
-  #grip-wrap { position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%); text-align: center; }
-  #grip { width: 300px; height: 104px; }
+  #grip-wrap { position: absolute; right: 18px; bottom: 18px; text-align: center; }   /* out of the skier's way */
+  #grip { width: 270px; height: 94px; }
+  @media (max-width: 700px) { #grip { width: 200px; height: 70px; } }
   #popups { position: absolute; left: 50%; top: 24%; transform: translateX(-50%); width: 520px; text-align: center; }
   .popup {
     font: 800 22px/1.25 system-ui, sans-serif; letter-spacing: 0.02em; color: #fff; margin: 4px 0;
@@ -84,7 +85,7 @@
     position: absolute; left: 50%; top: 38%; transform: translate(-50%, -50%); font: 900 72px/1 system-ui, sans-serif;
     letter-spacing: 0.08em; color: #fff; text-shadow: 0 4px 24px rgba(0,0,0,0.5); opacity: 0; transition: opacity 0.25s;
   }
-  #hint { position: absolute; left: 50%; bottom: 132px; transform: translateX(-50%); font-size: 14px; color: #fff; text-shadow: 0 1px 4px rgba(0,0,0,0.7); opacity: 0; transition: opacity 0.4s; white-space: nowrap; }
+  #hint { position: absolute; left: 50%; bottom: 40px; transform: translateX(-50%); font-size: 14px; color: #fff; text-shadow: 0 1px 4px rgba(0,0,0,0.7); opacity: 0; transition: opacity 0.4s; white-space: nowrap; }
 
   /* ---------------- Screens ---------------- */
   .screen {
