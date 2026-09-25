@@ -1466,6 +1466,32 @@ vec3 flHash32(vec2 p) {
 }
 float flHash12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
 `;
+/*
+ * Forest seen from afar: individual snowy spruces, one chance per 6.4 m cell, present with
+ * probability = forest density. On a slope a tree seen from across the valley covers a narrow
+ * triangle of hillside pointing uphill from its base (its crown projected onto the slope behind
+ * it), so each tree is drawn as that triangle; on flat ground it becomes a round crown seen from
+ * above. Where a cell shrinks to a few pixels the shapes fade into their mean coverage, so
+ * distant forest never shimmers. Returns tree coverage (0..1).
+ */
+const FOREST_GLSL = /* glsl */`
+float flTreeDots(vec2 p, float dens, vec3 N) {
+  vec2 c = p * (1.0 / 6.4), i = floor(c), f = fract(c);
+  vec3 h = flHash32(i + 17.0);
+  float px = length(fwidth(c));
+  float tilt = length(N.xz);
+  vec2 up = tilt > 1e-3 ? -N.xz / tilt : vec2(0.0, 1.0);          // uphill, horizontal
+  vec2 b = 0.5 - up * 0.36 + (h.xy - 0.5) * 0.18;                  // tree base inside its cell
+  vec2 d = f - b;
+  float along = dot(d, up), across = abs(dot(d, vec2(-up.y, up.x)));
+  float L = 0.78 * (0.8 + 0.4 * h.z), W = 0.2 * (0.8 + 0.4 * h.y);
+  float tri = smoothstep(-px, px, min(along, L - along)) * smoothstep(-px, px, W * (1.0 - along / L) - across);
+  float disc = 1.0 - smoothstep(0.26 - px, 0.26 + px, length(f - 0.5 - (h.xy - 0.5) * 0.3));
+  float shape = mix(disc, tri, smoothstep(0.05, 0.25, tilt));
+  float on = step(h.z * 0.6 + h.x * 0.4, dens);
+  return mix(shape * on, dens * mix(0.21, L * W, smoothstep(0.05, 0.25, tilt)), smoothstep(0.12, 0.35, px));
+}
+`;
 
 // ---------------------------------------------------------------- renderer & scenes
 function createRenderer() {
@@ -1892,7 +1918,7 @@ function snowCompile(shader) {
   shader.uniforms.uSparkle = U.uSparkle;
   patchCommon(shader,
     'attribute vec4 aSnow;\nuniform vec2 uTexOrigin;\nvarying vec4 vSnow;\nvarying vec2 vTC;\nvarying vec3 vWN;\n',
-    'uniform sampler2D uGrain;\nuniform sampler2D uWind;\nuniform sampler2D uRock;\nuniform float uSparkle;\nvarying vec4 vSnow;\nvarying vec2 vTC;\nvarying vec3 vWN;\n');
+    'uniform sampler2D uGrain;\nuniform sampler2D uWind;\nuniform sampler2D uRock;\nuniform float uSparkle;\nvarying vec4 vSnow;\nvarying vec2 vTC;\nvarying vec3 vWN;\n' + FOREST_GLSL);
   let v = shader.vertexShader;
   v = hook(v, '#include <begin_vertex>', '#include <begin_vertex>\nvSnow = aSnow;\nvTC = position.xz + uTexOrigin;\nvWN = normalize(mat3(modelMatrix) * objectNormal);', 'snow-v');
   shader.vertexShader = v;
@@ -1904,7 +1930,8 @@ function snowCompile(shader) {
     vec4 flWi = texture2D(uWind, vTC * (1.0 / 16.0));
     vec4 flBig = texture2D(uWind, (vTC + vFW.y * vec2(0.63, -0.41)) * (1.0 / 64.0) + 0.37);
     float flSlope = 1.0 - flN.y;
-    float flRockAmt = smoothstep(0.30, 0.46, flSlope + (flBig.b - 0.5) * 0.2);
+    // rock: crisp-edged outcrops on faces too steep to hold snow (two noise scales break the edge)
+    float flRockAmt = smoothstep(0.33, 0.41, flSlope + (flBig.b - 0.5) * 0.22 + (flWi.b - 0.5) * 0.07);
     vec3 flRockCol = vec3(0.0);
     if (flRockAmt > 0.001) {                          // triplanar rock on steep faces
       vec3 w = pow(abs(flN), vec3(4.0)); w /= (w.x + w.y + w.z);
@@ -1915,8 +1942,9 @@ function snowCompile(shader) {
     float flIce = vSnow.w;
     flAlb = mix(flAlb, vec3(0.6, 0.7, 0.83), flIce * 0.75);
     float flAway = abs(vSnow.x) - vSnow.y;
-    float flForest = smoothstep(118.0, 150.0, flAway) * smoothstep(0.38, 0.62, flBig.b + 0.3 * (flWi.b - 0.5)) * (1.0 - flRockAmt);
-    vec3 flForestCol = mix(vec3(0.02, 0.04, 0.028), vec3(0.6, 0.64, 0.7), smoothstep(0.5, 0.78, flGr.b));
+    float flForestD = smoothstep(118.0, 150.0, flAway) * smoothstep(0.34, 0.6, flBig.b + 0.3 * (flWi.b - 0.5)) * (1.0 - flRockAmt);
+    float flForest = flTreeDots(vTC, flForestD * 0.9, flN);
+    vec3 flForestCol = mix(vec3(0.02, 0.04, 0.028), vec3(0.62, 0.66, 0.72), 0.16 + 0.2 * smoothstep(0.5, 0.78, flGr.b));
     flAlb = mix(flAlb, flRockCol, flRockAmt);
     flAlb = mix(flAlb, flForestCol, flForest);
     diffuseColor.rgb = flAlb;
@@ -2486,7 +2514,7 @@ function makeFarMaterial() {
     shader.uniforms.uWind = { value: TEX.wind };
     patchCommon(shader,
       `attribute vec4 aFar;\nattribute vec3 aRange;\nuniform vec2 uStrip;\nuniform float uLift;\nvarying vec3 vFar;\nvarying vec3 vFarN;\n`,
-      `uniform sampler2D uGrain;\nuniform sampler2D uWind;\nvarying vec3 vFar;\nvarying vec3 vFarN;\n`);
+      `uniform sampler2D uGrain;\nuniform sampler2D uWind;\nvarying vec3 vFar;\nvarying vec3 vFarN;\n` + FOREST_GLSL);
     let v = shader.vertexShader;
     v = hook(v, '#include <beginnormal_vertex>', /* glsl */`#include <beginnormal_vertex>
       float flDz = position.z - cameraPosition.z;
@@ -2514,7 +2542,7 @@ function makeFarMaterial() {
       vec4 flBig = texture2D(uWind, flTC * (1.0 / 64.0) + 0.37);
       vec4 flHuge = texture2D(uWind, flTC * (1.0 / 2048.0) + 0.61);
       float flGrB = texture2D(uGrain, vFW.xz * (1.0 / 1.6)).b;
-      float flRockAmt = smoothstep(0.30, 0.46, (1.0 - flN.y) + (flBig.b - 0.5) * 0.2 + (flHuge.b - 0.5) * 0.12);
+      float flRockAmt = smoothstep(0.33, 0.41, (1.0 - flN.y) + (flBig.b - 0.5) * 0.22 + (flWi.b - 0.5) * 0.07 + (flHuge.b - 0.5) * 0.12);
       vec3 flAlb = vec3(0.86, 0.9, 0.955) * (0.94 + 0.09 * flBig.b);
       // painted forest exactly as on the strip's valley walls, the modelled trees' cover near the
       // run, and a ragged tree line ~${FAR.TREELINE} m above the valley floor
@@ -2522,10 +2550,10 @@ function makeFarMaterial() {
       // general forest pattern, so they don't draw converging stripes up the far valley.
       float flFarK = smoothstep(3500.0, 6500.0, length(vFW - cameraPosition));
       float flAway = mix(vFar.x, 1000.0, flFarK);
-      float flPaint = smoothstep(118.0, 150.0, flAway) * smoothstep(0.38, 0.62, flBig.b + 0.3 * (flWi.b - 0.5));
+      float flPaint = smoothstep(118.0, 150.0, flAway) * smoothstep(0.34, 0.6, flBig.b + 0.3 * (flWi.b - 0.5));
       float flTreeLine = 1.0 - smoothstep(${(FAR.TREELINE - 160).toFixed(1)}, ${(FAR.TREELINE + 160).toFixed(1)}, vFar.y + (flHuge.g - 0.5) * 500.0);
-      float flForest = max(flPaint, vFar.z * (1.0 - flFarK)) * flTreeLine * (1.0 - flRockAmt);
-      vec3 flForestCol = mix(vec3(0.02, 0.04, 0.028), vec3(0.6, 0.64, 0.7), smoothstep(0.5, 0.78, flGrB));
+      float flForest = flTreeDots(vFW.xz, max(flPaint * 0.9, vFar.z * (1.0 - flFarK)) * flTreeLine * (1.0 - flRockAmt), flN);
+      vec3 flForestCol = mix(vec3(0.02, 0.04, 0.028), vec3(0.62, 0.66, 0.72), 0.16 + 0.2 * smoothstep(0.5, 0.78, flGrB));
       vec3 flRockCol = vec3(0.105, 0.098, 0.092) * (0.75 + 0.5 * flHuge.r);
       flAlb = mix(flAlb, flRockCol, flRockAmt);
       flAlb = mix(flAlb, flForestCol, flForest);
