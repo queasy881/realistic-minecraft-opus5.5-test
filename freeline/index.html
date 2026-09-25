@@ -94,6 +94,7 @@
   .card {
     width: min(620px, 94vw); padding: 30px 32px 26px; border-radius: 18px; background: var(--panel-strong);
     border: 1px solid var(--line); backdrop-filter: blur(12px); box-shadow: 0 24px 70px rgba(0,0,0,0.45);
+    max-height: calc(100vh - 24px); overflow-y: auto;
   }
   .logo {
     margin: 0; text-align: center; font: 900 58px/1 system-ui, sans-serif; letter-spacing: 0.24em; padding-left: 0.24em;
@@ -140,6 +141,29 @@
   .row2 .btn { flex: 1; }
   h2.head { margin: 0; text-align: center; font: 900 34px/1.1 system-ui, sans-serif; letter-spacing: 0.1em; }
   .sub { text-align: center; color: var(--muted); font-size: 14px; margin-top: 6px; }
+  /* short windows (laptops, small browser windows): tighten the cards so they fit without scrolling */
+  @media (max-height: 760px) {
+    .card { padding: 18px 24px 16px; }
+    .logo { font-size: 44px; }
+    .tag { margin: 4px 0 12px; }
+    .opts { margin-bottom: 12px; gap: 8px 12px; }
+    .keys { margin-top: 12px; gap: 4px 10px; }
+    .note { margin-top: 10px; }
+    h2.head { font-size: 28px; }
+    .stats { gap: 8px; margin: 12px 0 10px; }
+    .stat { padding: 8px 12px; }
+    .stat .v { font-size: 22px; }
+    .stat.total .v { font-size: 30px; }
+    .best { margin-bottom: 8px; }
+    .btn { padding: 12px 16px; }
+  }
+  @media (max-height: 560px) {
+    .keys, .note { display: none; }
+    .logo { font-size: 36px; }
+    .stats { grid-template-columns: 1fr 1fr 1fr; }
+    .stat .k { font-size: 10px; }
+    .stat .v { font-size: 18px; }
+  }
 </style>
 </head>
 <body>
@@ -330,8 +354,8 @@ const VISUAL = {
   FOG_DIST: 11000,            // aerial-perspective scale (m): clear, dry mountain air
   VALLEY_HAZE: 0.35,          // extra haze pooled in the valley below you (0..1)
   EXPOSURE: 0.62,
-  BLOOM_STRENGTH: 0.5,
-  BLOOM_THRESHOLD: 1.25,
+  BLOOM_STRENGTH: 0.32,
+  BLOOM_THRESHOLD: 1.9,
   SPRAY_MAX: 7000,
   TRACK_SAMPLES: 3200,        // ring-buffer samples per ski
   TRACK_SPACING: 0.3,         // m between track samples
@@ -502,6 +526,7 @@ class Course {
     this.salt = (this.seed * 2654435761) | 0;
     this.sections = [];
     this.cliffs = []; this.rollers = []; this.kickers = [];
+    this.cliffEnds = []; this.cliffDropSum = [];          // sorted face ends + running total of drops
     this.featureBuckets = new Map();
     this.cap = 0; this.count = 0;
     this.arr = {};
@@ -550,6 +575,8 @@ class Course {
         const drop = 2.0 + 2.8 * Math.min(d, 1.2) + r() * 1.0;
         const f = { kind: 'cliff', z, drop, lip: 0.35 + r() * 0.25, len: 2.2 + r() * 0.8, land: 34 + drop * 6 };
         this.cliffs.push(f); this.index(f, z - 8, z + f.len + f.land + 4);
+        this.cliffEnds.push(z + f.len);
+        this.cliffDropSum.push((this.cliffDropSum.length ? this.cliffDropSum[this.cliffDropSum.length - 1] : 0) + drop);
       }
     } else if (type === 'steep') {
       for (let z = z0 + 60 + r() * 40; z < z1 - 40; z += 70 + r() * 60) {
@@ -643,17 +670,24 @@ class Course {
     return out;
   }
   // Cliffs (full-width drops with a small lip) and rollers (convex humps that throw you in the air).
+  // Total drop of every cliff whose face ends at or before z. A cliff lowers the whole course
+  // below it for good, so this is a running sum (binary search), not a local bump.
+  droppedBefore(z) {
+    const E = this.cliffEnds;
+    let lo = 0, hi = E.length;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (E[m] <= z) lo = m + 1; else hi = m; }
+    return lo ? this.cliffDropSum[lo - 1] : 0;
+  }
   featureAlt(z) {
+    let h = -this.droppedBefore(z);
     const list = this.featureBuckets.get(Math.floor(z / FEATURE_BUCKET));
-    if (!list) return 0;
-    let h = 0;
+    if (!list) return h;
     for (const f of list) {
-      if (f.kind === 'cliff') {
+      if (f.kind === 'cliff') {                           // the lip and the face itself
         const s = z - f.z;
-        if (s < -6) continue;
+        if (s < -6 || s >= f.len) continue;
         if (s < 0) h += f.lip * smoothstep(-6, 0, s);
-        else if (s < f.len) { const t = s / f.len; h += f.lip * (1 - t) - f.drop * smootherstep(t); }
-        else h -= f.drop;
+        else { const t = s / f.len; h += f.lip * (1 - t) - f.drop * smootherstep(t); }
       } else if (f.kind === 'roller') {
         const s = (z - f.z) / f.w;
         if (s > -1 && s < 1) { const c = Math.cos(s * Math.PI * 0.5); h += f.h * c * c; }
@@ -1510,7 +1544,7 @@ void main() {
   float c = dot(dir, uSunDir);
   float above = smoothstep(-0.02, 0.02, dir.y);
   // sun disk + corona (HDR: bloom and tone mapping turn it into a blinding white disk)
-  col += uSunColor * (smoothstep(0.99989, 0.99994, c) * 40.0 + pow(max(c, 0.0), 1600.0) * 5.0 + pow(max(c, 0.0), 120.0) * 0.25) * above;
+  col += uSunColor * (smoothstep(0.99989, 0.99994, c) * 22.0 + pow(max(c, 0.0), 1600.0) * 3.0 + pow(max(c, 0.0), 120.0) * 0.2) * above;
   // thin, high cirrus: a wispy texture projected on a far-away layer
   if (dir.y > 0.01) {
     vec2 p = dir.xz / (dir.y + 0.08) * 0.22 + vec2(uTime * 0.0012, uTime * 0.0004);
@@ -1603,7 +1637,7 @@ function initPost() {
       vec3 c = texture2D(tSrc, vUv + uTexel * vec2(-0.5, -0.5)).rgb + texture2D(tSrc, vUv + uTexel * vec2(0.5, -0.5)).rgb
              + texture2D(tSrc, vUv + uTexel * vec2(-0.5, 0.5)).rgb + texture2D(tSrc, vUv + uTexel * vec2(0.5, 0.5)).rgb;
       c *= 0.25;
-      c = min(c, vec3(60.0));
+      c = min(c, vec3(14.0));                      // keep the sun disk from flooding the frame
       float br = max(max(c.r, c.g), c.b);
       float knee = uThreshold * 0.5;
       float soft = clamp(br - uThreshold + knee, 0.0, 2.0 * knee);
@@ -1889,10 +1923,10 @@ function snowCompile(shader) {
     flRough = mix(flRough, 0.84, max(flRockAmt, flForest));
     // detail normals, perturbed in world space (the terrain is a height field)
     float flFine = 1.0 - smoothstep(18.0, 70.0, flDist);
-    vec2 flP = (flGr.xy * 2.0 - 1.0) * 0.34 * flFine * (1.0 - flIce * 0.8)
+    vec2 flP = (flGr.xy * 2.0 - 1.0) * 0.22 * flFine * (1.0 - flIce * 0.8)
              + (flWi.xy * 2.0 - 1.0) * 0.4 * (1.0 - vSnow.z * 0.75) * (1.0 - flIce);
     float flCordW = fwidth(vTC.x) / 0.042;           // corduroy cycles per pixel (anti-aliasing fade)
-    flP.x += cos(vTC.x * 149.6) * 0.22 * vSnow.z * (1.0 - smoothstep(0.2, 0.5, flCordW)) * (1.0 - flIce);
+    flP.x += cos(vTC.x * 149.6) * 0.13 * vSnow.z * (1.0 - smoothstep(0.2, 0.5, flCordW)) * (1.0 - flIce);
     vec3 flNw = normalize(flN + vec3(flP.x, 0.0, flP.y) * (1.0 - flRockAmt) * (1.0 - flForest * 0.6));
     vec3 flNv = normalize((viewMatrix * vec4(flNw, 0.0)).xyz);
   `, 'snow-map');
@@ -2707,16 +2741,17 @@ function initSpray() {
       attribute vec3 aVel;
       attribute vec4 aInfo;            // x: birth time, y: life, z: size, w: 1 = in sunlight
       uniform float uNow; uniform float uScale;
-      varying float vAlpha; varying float vLit; varying vec3 vWP;
+      varying float vAlpha; varying float vLit; varying vec3 vWP; varying float vSeed;
       void main() {
         float t = uNow - aInfo.x;
+        vSeed = aInfo.x * 7.13 + position.x * 3.1;
         if (t < 0.0 || t > aInfo.y) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; vAlpha = 0.0; return; }
         float k = 2.2;                                     // air drag on fine snow
         float e = 1.0 - exp(-k * t);
         vec3 p = position + aVel * (e / k) + vec3(0.0, -9.81, 0.0) * (t / k - e / (k * k));
         vec4 mv = modelViewMatrix * vec4(p, 1.0);
         gl_Position = projectionMatrix * mv;
-        float grow = 1.0 + t * 2.6;
+        float grow = 1.0 + t * 1.4;
         gl_PointSize = clamp(aInfo.z * grow * uScale / -mv.z, 0.0, 256.0);
         float life = t / aInfo.y;
         vAlpha = (1.0 - life) * (1.0 - life) * min(t * 18.0, 1.0);
@@ -2724,7 +2759,9 @@ function initSpray() {
       }`,
     fragmentShader: /* glsl */`
       ${SKY_GLSL}
-      varying float vAlpha; varying float vLit; varying vec3 vWP;
+      uniform float uNow;
+      varying float vAlpha; varying float vLit; varying vec3 vWP; varying float vSeed;
+      #define uNowF uNow
       void main() {
         vec2 d = gl_PointCoord - 0.5;
         float r2 = dot(d, d) * 4.0;
@@ -2732,7 +2769,9 @@ function initSpray() {
         float a = (1.0 - r2); a *= a;
         vec3 V = normalize(vWP - cameraPosition);
         float fwd = pow(max(dot(V, uSunDir), 0.0), 6.0);   // spray glows when backlit by the sun
-        vec3 col = uSkyLight * 0.42 + uSunColor * vLit * (0.32 + 1.3 * fwd);
+        // ice grains: most scatter softly, a few catch the sun and glint
+        float glint = step(0.93, fract(sin(vSeed * 91.7) * 4375.85)) * vLit * (0.5 + 0.5 * sin(uNowF * 40.0 + vSeed * 13.0));
+        vec3 col = uSkyLight * 0.75 + uSunColor * vLit * (0.32 + 1.3 * fwd + 2.5 * glint);
         float dist = length(vWP - cameraPosition);
         col = mix(col, flSky(V), flFogAmount(dist, vWP.y - cameraPosition.y));
         gl_FragColor = vec4(col, a * vAlpha * 0.55);
@@ -2959,26 +2998,69 @@ const FX = {
  */
 const SK = { root: null, joints: {}, pose: null, tumbleQ: new THREE.Quaternion() };
 const SHIN = 0.46, THIGH = 0.44;
+// Rounded limb segment: a lathed capsule from y = 0 (radius r0) to y = len (radius r1).
+function capsuleGeo(r0, r1, len, seg = 10) {
+  const pts = [];
+  for (let i = 0; i <= 3; i++) { const a = -Math.PI / 2 + (i / 3) * (Math.PI / 2); pts.push(new THREE.Vector2(Math.cos(a) * r0 + 1e-4, Math.sin(a) * r0)); }
+  for (let i = 0; i <= 3; i++) { const a = (i / 3) * (Math.PI / 2); pts.push(new THREE.Vector2(Math.cos(a) * r1 + 1e-4, len + Math.sin(a) * r1)); }
+  return new THREE.LatheBufferGeometry(pts, seg);
+}
+function latheGeo(profile, seg = 14) { return new THREE.LatheBufferGeometry(profile.map(([r, y]) => new THREE.Vector2(r + 1e-4, y)), seg); }
+// A carving ski with real sidecut (118 / 70 / 102 mm), a raised tip and tail, and a graphic top
+// sheet in vertex colours. Built as separate top, base and side strips for crisp edges.
+function skiGeo() {
+  const L = 1.65, N = 26, th = 0.017, P = [], C = [], I = [];
+  const station = (u) => {
+    const tipSide = u > 0.52;
+    let w = 0.07 + (tipSide ? 0.048 * Math.pow((u - 0.52) / 0.43, 2) : 0.032 * Math.pow((0.52 - u) / 0.49, 2));
+    if (u > 0.95) w *= 1 - Math.pow((u - 0.95) / 0.05, 2) * 0.55;
+    if (u < 0.03) w *= 1 - Math.pow((0.03 - u) / 0.03, 2) * 0.35;
+    const rise = u > 0.86 ? Math.pow((u - 0.86) / 0.14, 2) * 0.075 : u < 0.06 ? Math.pow((0.06 - u) / 0.06, 2) * 0.03 : 0;
+    return { z: (u - 0.47) * L, w, rise };
+  };
+  const top = (u) => u > 0.3 && u < 0.62 ? [0.92, 0.92, 0.9] : (Math.floor(u * 9) % 2 ? [0.75, 0.08, 0.05] : [0.1, 0.1, 0.12]);
+  const strip = (fn, col) => {
+    const base = P.length / 3;
+    for (let i = 0; i <= N; i++) {
+      const u = i / N, st = station(u), [a, b] = fn(st);
+      P.push(...a, ...b);
+      const c = col(u); C.push(...c, ...c);
+    }
+    for (let i = 0; i < N; i++) { const k = base + i * 2; I.push(k, k + 2, k + 1, k + 1, k + 2, k + 3); }
+  };
+  strip((st) => [[-st.w / 2, st.rise + th, st.z], [st.w / 2, st.rise + th, st.z]], top);                       // top sheet
+  strip((st) => [[st.w / 2, st.rise, st.z], [-st.w / 2, st.rise, st.z]], () => [0.02, 0.02, 0.025]);          // base
+  strip((st) => [[st.w / 2, st.rise + th, st.z], [st.w / 2, st.rise, st.z]], () => [0.35, 0.36, 0.38]);        // +x edge
+  strip((st) => [[-st.w / 2, st.rise, st.z], [-st.w / 2, st.rise + th, st.z]], () => [0.35, 0.36, 0.38]);      // -x edge
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(P, 3));
+  g.setAttribute('color', new THREE.Float32BufferAttribute(C, 3));
+  g.setIndex(I);
+  g.computeVertexNormals();
+  return g;
+}
 function buildSkier() {
-  const mat = (c, r, m = 0) => new THREE.MeshStandardMaterial({ color: c, roughness: r, metalness: m });
+  const mat = (c, r, m = 0, extra = {}) => new THREE.MeshStandardMaterial(Object.assign({ color: c, roughness: r, metalness: m }, extra));
   const M = {
-    jacket: mat(0xd23a2a, 0.62), jacket2: mat(0xf2f2ee, 0.6), pants: mat(0x1c2433, 0.78), boot: mat(0x3a4150, 0.35),
-    ski: mat(0xf1efe8, 0.32), skiTop: mat(0xd23a2a, 0.35), base: mat(0x0e0f12, 0.25), helmet: mat(0xeeeeee, 0.28),
-    goggle: mat(0xffa640, 0.06, 1.0), glove: mat(0x16181d, 0.82), pole: mat(0xc8ccd2, 0.28, 0.9), skin: mat(0xd49a78, 0.6),
+    jacket: mat(0xc8301f, 0.58), jacket2: mat(0xeceae4, 0.6), pants: mat(0x1b2230, 0.74), boot: mat(0x2b303b, 0.3),
+    ski: mat(0xffffff, 0.3, 0, { vertexColors: true }), helmet: mat(0xf0f0ee, 0.25), strap: mat(0x15171b, 0.7),
+    goggle: mat(0xff9a30, 0.05, 1.0), glove: mat(0x14161a, 0.8), pole: mat(0xc8ccd2, 0.28, 0.9), skin: mat(0xc98e6c, 0.62),
+    buckle: mat(0x9aa0aa, 0.25, 0.9),
   };
   const mesh = (geo, m) => { const o = new THREE.Mesh(geo, m); o.castShadow = true; o.receiveShadow = true; return o; };
-  const limb = (r0, r1, len, m, seg = 8) => { const g = new THREE.CylinderBufferGeometry(r1, r0, len, seg); g.translate(0, len / 2, 0); return mesh(g, m); };
   const J = SK.joints;
   const root = new THREE.Group();
-  // skis
+  // skis + boots (the boots are part of the ski group so they roll with the edge)
+  const skiG = skiGeo();
   for (const side of [1, -1]) {
     const ski = new THREE.Group();
     ski.position.set(side * 0.12, 0.012, 0);
-    const plank = mesh(new THREE.BoxBufferGeometry(0.078, 0.02, 1.62), M.ski); plank.position.z = -0.05; ski.add(plank);
-    const top = mesh(new THREE.BoxBufferGeometry(0.05, 0.004, 1.3), M.skiTop); top.position.set(0, 0.012, -0.1); ski.add(top);
-    const base = mesh(new THREE.BoxBufferGeometry(0.078, 0.004, 1.62), M.base); base.position.set(0, -0.012, -0.05); ski.add(base);
-    const tip = mesh(new THREE.BoxBufferGeometry(0.074, 0.018, 0.2), M.ski); tip.position.set(0, 0.035, 0.83); tip.rotation.x = -0.42; ski.add(tip);
-    const boot = mesh(new THREE.BoxBufferGeometry(0.12, 0.19, 0.3), M.boot); boot.position.set(0, 0.1, -0.02); ski.add(boot);
+    ski.add(mesh(skiG, M.ski));
+    const binding = mesh(new THREE.BoxBufferGeometry(0.075, 0.03, 0.42), M.buckle); binding.position.set(0, 0.03, -0.02); ski.add(binding);
+    const shell = mesh(latheGeo([[0, 0], [0.07, 0.0], [0.075, 0.12], [0.068, 0.26], [0.072, 0.31], [0, 0.31]], 10), M.boot);
+    shell.scale.set(0.95, 1, 1.25); shell.position.set(0, 0.045, -0.02); shell.rotation.x = 0.18; ski.add(shell);
+    const toe = mesh(new THREE.BoxBufferGeometry(0.1, 0.075, 0.2), M.boot); toe.position.set(0, 0.08, 0.1); ski.add(toe);
+    for (const y of [0.13, 0.21]) { const b = mesh(new THREE.BoxBufferGeometry(0.15, 0.018, 0.03), M.buckle); b.position.set(0, 0.045 + y, 0.06 + y * 0.18); ski.add(b); }
     root.add(ski);
     J[side > 0 ? 'skiL' : 'skiR'] = ski;
   }
@@ -2986,36 +3068,41 @@ function buildSkier() {
   const legs = [];
   for (const side of [1, -1]) {
     const ankle = new THREE.Group(); ankle.position.set(side * 0.12, 0.17, -0.03); lean.add(ankle);
-    ankle.add(limb(0.055, 0.068, SHIN, M.pants));
+    ankle.add(mesh(capsuleGeo(0.072, 0.078, SHIN), M.pants));                        // baggy ski pants over the boot cuff
     const knee = new THREE.Group(); knee.position.y = SHIN; ankle.add(knee);
-    knee.add(limb(0.07, 0.085, THIGH, M.pants));
+    knee.add(mesh(capsuleGeo(0.082, 0.094, THIGH), M.pants));
     const hip = new THREE.Group(); hip.position.y = THIGH; knee.add(hip);
     legs.push({ ankle, knee, hip });
   }
   J.legs = legs;
   // pelvis & torso hang off the left hip (both legs share the same joint angles)
   const pelvis = new THREE.Group(); pelvis.position.x = -0.12; legs[0].hip.add(pelvis); J.pelvis = pelvis;
-  const hips = mesh(new THREE.BoxBufferGeometry(0.34, 0.16, 0.2), M.pants); hips.position.y = 0.02; pelvis.add(hips);
+  const hips = mesh(latheGeo([[0, -0.08], [0.13, -0.075], [0.175, 0.0], [0.17, 0.08], [0.15, 0.14], [0, 0.14]]), M.pants);
+  hips.scale.z = 0.78; pelvis.add(hips);
   const torso = new THREE.Group(); torso.position.y = 0.06; pelvis.add(torso); J.torso = torso;
-  const chestGeo = new THREE.CylinderBufferGeometry(0.19, 0.16, 0.52, 10); chestGeo.translate(0, 0.26, 0);
-  const chest = mesh(chestGeo, M.jacket); chest.scale.z = 0.72; torso.add(chest);
-  const stripe = mesh(new THREE.BoxBufferGeometry(0.3, 0.06, 0.02), M.jacket2); stripe.position.set(0, 0.36, 0.13); torso.add(stripe);
-  const neck = new THREE.Group(); neck.position.y = 0.55; torso.add(neck); J.neck = neck;
-  const head = mesh(new THREE.SphereBufferGeometry(0.105, 14, 10), M.skin); head.position.y = 0.11; neck.add(head);
-  const helmet = mesh(new THREE.SphereBufferGeometry(0.122, 16, 10, 0, Math.PI * 2, 0, Math.PI * 0.58), M.helmet); helmet.position.y = 0.125; neck.add(helmet);
-  const gog = mesh(new THREE.CylinderBufferGeometry(0.118, 0.118, 0.055, 16, 1, true, -Math.PI * 0.38, Math.PI * 0.76), M.goggle);
-  gog.position.set(0, 0.125, 0.004); gog.rotation.y = 0; neck.add(gog);
+  // insulated jacket: waist -> chest -> rounded shoulders, a little flattened front to back
+  const chest = mesh(latheGeo([[0, -0.03], [0.16, -0.02], [0.18, 0.1], [0.19, 0.28], [0.205, 0.43], [0.19, 0.52], [0.12, 0.585], [0.06, 0.6], [0, 0.6]], 16), M.jacket);
+  chest.scale.z = 0.72; torso.add(chest);
+  const yoke = mesh(latheGeo([[0.19, 0.3], [0.207, 0.36], [0.2, 0.41]], 16), M.jacket2); yoke.scale.z = 0.735; torso.add(yoke);
+  const collar = mesh(capsuleGeo(0.07, 0.065, 0.06, 10), M.strap); collar.position.y = 0.55; torso.add(collar);   // neck gaiter
+  const neck = new THREE.Group(); neck.position.y = 0.58; torso.add(neck); J.neck = neck;
+  const head = mesh(new THREE.SphereBufferGeometry(0.1, 14, 10), M.skin); head.position.set(0, 0.1, 0.01); neck.add(head);
+  const helmet = mesh(new THREE.SphereBufferGeometry(0.125, 18, 12, 0, Math.PI * 2, 0, Math.PI * 0.6), M.helmet); helmet.position.y = 0.118; helmet.scale.z = 1.08; neck.add(helmet);
+  const strap = mesh(new THREE.CylinderBufferGeometry(0.127, 0.127, 0.05, 20, 1, true), M.strap); strap.position.y = 0.118; strap.scale.z = 1.08; neck.add(strap);
+  const gog = mesh(new THREE.CylinderBufferGeometry(0.131, 0.131, 0.062, 20, 1, true, -Math.PI * 0.36, Math.PI * 0.72), M.goggle);
+  gog.position.set(0, 0.118, 0.004); gog.scale.z = 1.08; neck.add(gog);
   const arms = [];
   for (const side of [1, -1]) {
     const sh = new THREE.Group(); sh.position.set(side * 0.2, 0.47, 0); torso.add(sh);
-    const upper = limb(0.048, 0.055, 0.3, M.jacket); upper.rotation.x = Math.PI; sh.add(upper);     // hangs down
-    const elbow = new THREE.Group(); elbow.position.y = -0.3; sh.add(elbow);
-    const fore = limb(0.042, 0.048, 0.27, M.jacket); fore.rotation.x = Math.PI; elbow.add(fore);
+    const upper = mesh(capsuleGeo(0.06, 0.066, 0.28), M.jacket); upper.rotation.x = Math.PI; sh.add(upper);     // hangs down
+    const elbow = new THREE.Group(); elbow.position.y = -0.29; sh.add(elbow);
+    const fore = mesh(capsuleGeo(0.05, 0.058, 0.25), M.jacket); fore.rotation.x = Math.PI; elbow.add(fore);
     const hand = new THREE.Group(); hand.position.y = -0.3; elbow.add(hand);
-    hand.add(mesh(new THREE.SphereBufferGeometry(0.048, 8, 6), M.glove));
+    const mitt = mesh(new THREE.SphereBufferGeometry(0.052, 10, 8), M.glove); mitt.scale.set(1, 1.25, 1.35); hand.add(mitt);
     const pole = new THREE.Group(); hand.add(pole);
-    const shaft = limb(0.008, 0.009, 1.18, M.pole, 6); shaft.rotation.x = Math.PI; shaft.position.y = 0.06; pole.add(shaft);
-    const basket = mesh(new THREE.CylinderBufferGeometry(0.045, 0.045, 0.008, 10), M.pole); basket.position.y = -1.04; pole.add(basket);
+    const shaft = mesh(new THREE.CylinderBufferGeometry(0.009, 0.007, 1.18, 6), M.pole); shaft.position.y = -0.53; pole.add(shaft);
+    const grip = mesh(new THREE.CylinderBufferGeometry(0.017, 0.015, 0.14, 8), M.strap); grip.position.y = 0.0; pole.add(grip);
+    const basket = mesh(new THREE.CylinderBufferGeometry(0.045, 0.045, 0.008, 10), M.strap); basket.position.y = -1.04; pole.add(basket);
     arms.push({ sh, elbow, hand, pole });
   }
   J.arms = arms;
@@ -3097,7 +3184,25 @@ function poseSkier(dt, rp, rpsi) {
 // =====================================================================================
 const CAM = { pos: new THREE.Vector3(), look: new THREE.Vector3(), dir: new THREE.Vector3(0, 0, 1), mode: 0, t: 0, init: false };
 const CAM_MODES = [{ dist: 4.8, height: 1.9, look: 5.5 }, { dist: 2.9, height: 1.15, look: 7 }, { dist: 8.5, height: 3.6, look: 4 }];
-const _cv = new THREE.Vector3(), _cl = new THREE.Vector3();
+const _cv = new THREE.Vector3(), _cl = new THREE.Vector3(), _cf = new THREE.Vector3();
+// Walk the line from the skier to the wanted camera spot and stop short of the first tree crown it
+// would enter (otherwise a wipeout at a forest edge can leave the lens inside a spruce).
+function keepCameraOutOfTrees(from, to) {
+  const segs = world.segmentsNear(Math.min(from.z, to.z) - 6, Math.max(from.z, to.z) + 6);
+  for (let k = 1; k <= 8; k++) {
+    const t = k / 8, x = lerp(from.x, to.x, t), y = lerp(from.y, to.y, t), z = lerp(from.z, to.z, t);
+    for (const seg of segs) {
+      for (const o of seg.trees) {
+        const dx = x - o.x, dz = z - o.z, d2 = dx * dx + dz * dz;
+        if (d2 > 16) continue;
+        const hRel = (y - o.y) / o.height;
+        if (hRel < 0.05 || hRel > 1) continue;
+        const crown = 0.25 * o.height * Math.pow(1 - hRel, 0.85) + 0.35;
+        if (d2 < crown * crown) { to.lerpVectors(from, to, Math.max((k - 1) / 8, 0.3)); return; }
+      }
+    }
+  }
+}
 function updateCamera(dt, rp) {
   const s = skier, M = CAM_MODES[CAM.mode];
   const sp = s.speed;
@@ -3109,6 +3214,8 @@ function updateCamera(dt, rp) {
   _cl.copy(rp).addScaledVector(CAM.dir, -dist);
   _cl.y = rp.y + height + Math.max(0, (world.course.height(_cl.x, _cl.z) + 1.3) - (rp.y + height));
   _cl.y = Math.max(_cl.y, world.course.height(_cl.x, _cl.z) + 1.2);
+  _cf.copy(rp); _cf.y += 1.2;
+  keepCameraOutOfTrees(_cf, _cl);
   if (!CAM.init) { CAM.pos.copy(_cl); CAM.init = true; }
   CAM.pos.lerp(_cl, 1 - Math.exp(-dt * 9));
   CAM.pos.y = Math.max(CAM.pos.y, world.course.height(CAM.pos.x, CAM.pos.z) + 1.0);
@@ -3584,7 +3691,7 @@ function fatal(html) {
   $('start-btn').textContent = 'Unavailable';
 }
 // Small hook for automated tests / console tinkering.
-const FREELINE = window.FREELINE = { debugCam: null, farField, Game, skier, run, world, input, PHYS, TERRAIN, VISUAL, U, post, PERF, physicsStep, applyLight, applyQuality, get renderer() { return renderer; }, get camera() { return camera; } };
+const FREELINE = window.FREELINE = { debugCam: null, farField, internals: { updateStreaming, rebuildInstances, updateFarField, rebuildGates, renderFrame }, Game, skier, run, world, input, PHYS, TERRAIN, VISUAL, U, post, PERF, physicsStep, applyLight, applyQuality, get renderer() { return renderer; }, get camera() { return camera; } };
 boot().catch((err) => { console.error(err); fatal('Something went wrong while starting.<br><small>' + String(err && err.message || err) + '</small>'); });
 
 })();
