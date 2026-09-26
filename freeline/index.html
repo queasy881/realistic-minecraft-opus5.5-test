@@ -1886,7 +1886,7 @@ function makeBranchAtlas() {
   for (let x = 14, gap = 0; x < 900; x += 7) {
     if (gap > 0) { gap -= 7; continue; }
     if (rnd() < 0.025) { gap = 25 + rnd() * 45; continue; }
-    const k = 1 - x / 1150, w = (15 + 9 * Math.sin(x * 0.037 + 2.1) * Math.sin(x * 0.013) + 5 * rnd()) * k;
+    const k = 1 - x / 1150, w = (18 + 10 * Math.sin(x * 0.037 + 2.1) * Math.sin(x * 0.013) + 5 * rnd()) * k;
     const a = Math.atan2(twig(x + 4) - twig(x - 4), 8);
     snowPuff(x, twig(x) + (rnd() - 0.5) * 5, w * (1.2 + 0.5 * rnd()), w * (0.75 + 0.2 * rnd()), a);
   }
@@ -1906,14 +1906,19 @@ function makeBranchAtlas() {
     if (rnd() < 0.3) stroke(x, y, x + 8 + rnd() * 8, y - 5 - rnd() * 8, 1.6, green(1.2));
   }
   for (let x = 0; x < 730; x += 5) stroke(x, sy(x), x + 5, sy(x + 5), 4 - 2.5 * x / 736, '#3d2c1f');
-  // a continuous, lumpy cap of snow along the top of the branch (with the odd gap)
-  g.fillStyle = 'rgba(238,243,250,1)';
+  // a continuous, lumpy cap of snow along the top of the branch, 5-10 cm deep, thinning toward
+  // the tip (with the odd gap); its underside is in shade, a little blue-grey
+  const caps = [];
   for (let x = 8, gap = 0; x < 690; x += 5) {
     if (gap > 0) { gap -= 5; continue; }
-    if (rnd() < 0.04) { gap = 20 + rnd() * 40; continue; }
-    const r = 7 + 6 * Math.sin(x * 0.045 + 1.3) * Math.sin(x * 0.021) + 4 * rnd();
-    g.beginPath(); g.ellipse(x, sy(x) - r * 0.35, r * 1.3, r * 0.62, 0, 0, Math.PI * 2); g.fill();
+    if (rnd() < 0.035) { gap = 20 + rnd() * 35; continue; }
+    const r = (12 + 8 * Math.sin(x * 0.045 + 1.3) * Math.sin(x * 0.021) + 5 * rnd()) * (1 - 0.4 * x / 736);
+    caps.push([x, sy(x) - r * 0.42, r]);
   }
+  g.fillStyle = 'rgba(196,210,230,1)';
+  for (const [x, y, r] of caps) { g.beginPath(); g.ellipse(x, y + r * 0.2, r * 1.35, r * 0.7, 0, 0, Math.PI * 2); g.fill(); }
+  g.fillStyle = 'rgba(240,244,250,1)';
+  for (const [x, y, r] of caps) { g.beginPath(); g.ellipse(x, y - r * 0.08, r * 1.3, r * 0.62, 0, 0, Math.PI * 2); g.fill(); }
   // --- plain white (trunks) and the inner-crown needle mat
   g.fillStyle = '#ffffff'; g.fillRect(740, 488, 24, 24);
   g.save(); g.beginPath(); g.rect(768, 256, 256, 256); g.clip();
@@ -2518,6 +2523,58 @@ function makePlainFogMaterial(params, key) {
   const m = new THREE.MeshStandardMaterial(params);
   m.onBeforeCompile = (s) => patchCommon(s);
   m.customProgramCacheKey = () => 'fl-' + key;
+  return m;
+}
+/*
+ * Fabric (the skier's clothing). Technical fabric is a rough, matte weave: its fibres scatter away
+ * most of the mirror-like reflection a plastic would show, leaving a soft sheen at grazing angles.
+ * Relief, in object space (each part's y axis runs along the limb or up the torso): soft folds
+ * everywhere, and on insulated parts the puffy baffles of the quilting.
+ */
+const FABRIC_GLSL = /* glsl */`
+uniform float uQuilt;
+uniform float uSheen;
+varying vec3 vOP;
+float flFabricH(vec3 p) {
+  float h = flVN3(p * vec3(14.0, 30.0, 14.0)) * 0.007 + flVN3(p * vec3(5.0, 11.0, 5.0) + 3.1) * 0.012;
+  if (uQuilt > 0.0) { float q = fract(p.y * uQuilt) - 0.5; h += sqrt(max(1.0 - 4.0 * q * q, 0.0)) * 0.014; }
+  return h;
+}
+vec3 flBumpV(vec3 n, vec3 pos, float h) {
+  vec3 dpx = dFdx(pos), dpy = dFdy(pos);
+  vec3 r1 = cross(dpy, n), r2 = cross(n, dpx);
+  float det = dot(dpx, r1);
+  vec3 grad = sign(det) * (dFdx(h) * r1 + dFdy(h) * r2);
+  return normalize(abs(det) * n - grad);
+}
+`;
+function makeFabricMaterial(color, roughness, quilt = 0, sheen = 0.5) {
+  // (colours are given as sRGB hex; r128 does not convert material colours, so do it here)
+  const m = new THREE.MeshStandardMaterial({ color: new THREE.Color(color).convertSRGBToLinear(), roughness, metalness: 0 });
+  m.onBeforeCompile = (shader) => {
+    shader.uniforms.uQuilt = { value: quilt };
+    shader.uniforms.uSheen = { value: sheen };
+    patchCommon(shader, 'varying vec3 vOP;\n', VNOISE3_GLSL + FABRIC_GLSL);
+    shader.vertexShader = hook(shader.vertexShader, '#include <begin_vertex>', '#include <begin_vertex>\nvOP = position;', 'fab-v');
+    let f = shader.fragmentShader;
+    f = hook(f, '#include <normal_fragment_maps>', `{
+      float flPx = length(fwidth(vOP));                // relief fades before it could alias
+      normal = flBumpV(normal, -vViewPosition, flFabricH(vOP) * (1.0 - smoothstep(0.008, 0.025, flPx)));
+    }`, 'fab-normal');
+    f = hook(f, '#include <aomap_fragment>', `#include <aomap_fragment>
+    {
+      reflectedLight.directSpecular *= 0.45;
+      reflectedLight.indirectSpecular *= 0.3;
+      float flNV = clamp(dot(normal, geometry.viewDir), 0.0, 1.0);
+      vec3 flLv = normalize((viewMatrix * vec4(uSunDir, 0.0)).xyz);
+      float flSh = pow(1.0 - flNV, 4.0) * uSheen;
+      vec3 flShC = mix(diffuseColor.rgb, vec3(0.3), 0.5);
+      reflectedLight.directSpecular += uSunColor * flSunShadow * flSh * clamp(dot(normal, flLv), 0.0, 1.0) * flShC;
+      reflectedLight.indirectSpecular += uSkyLight * 0.12 * flSh * flShC;
+    }`, 'fab-sheen');
+    shader.fragmentShader = f;
+  };
+  m.customProgramCacheKey = () => 'fl-fabric';
   return m;
 }
 
@@ -3258,7 +3315,7 @@ function makeTreeGeometry(seed, tiers, spokes, width, underside, cards = 0, stat
   };
   const tint = () => { const k = 0.85 + 0.3 * rnd(); return [k * (0.95 + 0.1 * rnd()), k, k * (0.95 + 0.1 * rnd())]; };
   const [cu0, cu1, cv0, cv1] = ATLAS.core;
-  const sides = underside ? 6 : 4;
+  const sides = underside || cards > 5 ? 7 : 4;                       // trunk facets (round-ish up close)
   for (let i = 0; i <= sides; i++) {
     const a = (i / sides) * Math.PI * 2, c = Math.cos(a), sn = Math.sin(a);
     v(c * 0.022, -0.05, sn * 0.022, TREE_COLORS.bark, 0, ATLAS.white[0], ATLAS.white[1]);
@@ -3532,6 +3589,67 @@ function initSpray() {
   SPRAY.points.renderOrder = 20;
   scene.add(SPRAY.points);
 }
+/*
+ * Diamond dust: on cold, clear days the air holds a thin haze of drifting ice crystals - tiny
+ * hexagonal plates, invisible except when one tumbles into the angle that mirrors the sun into
+ * your eye and flashes. A box of points wrapped around the camera (so it never runs out), each a
+ * tumbling plate; its flash is a sharp specular lobe (with a faint forward-scattering glow toward
+ * the sun), additive HDR so the brightest flashes bloom. Off in shade.
+ */
+const DUST = { points: null, N: 2400, R: 22, sun: { value: 1 } };
+function initDust() {
+  const N = DUST.N, pos = new Float32Array(N * 3), seed = new Float32Array(N), rnd = mulberry32(4711);
+  for (let i = 0; i < N; i++) { for (let k = 0; k < 3; k++) pos[i * 3 + k] = (rnd() * 2 - 1) * DUST.R; seed[i] = rnd(); }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('aSeed', new THREE.BufferAttribute(seed, 1));
+  const mat = new THREE.ShaderMaterial({
+    uniforms: Object.assign({}, U, { uR: { value: DUST.R }, uDustSun: DUST.sun, uScale: { value: 800 } }),
+    vertexShader: /* glsl */`
+      attribute float aSeed;
+      uniform float uTime; uniform float uR; uniform float uDustSun; uniform float uScale;
+      uniform vec3 uSunDir;
+      varying float vGlint;
+      void main() {
+        // a light breeze, plus a slow individual wander
+        vec3 drift = vec3(0.45, -0.08, -0.25) * uTime + 0.4 * vec3(sin(uTime * 0.31 + aSeed * 40.0), 0.3 * sin(uTime * 0.23 + aSeed * 17.0), cos(uTime * 0.27 + aSeed * 29.0));
+        vec3 p = cameraPosition + mod(position + drift - cameraPosition + uR, 2.0 * uR) - uR;
+        vec4 mv = viewMatrix * vec4(p, 1.0);
+        float d = -mv.z;
+        vec3 V = normalize(cameraPosition - p);
+        vec3 H = normalize(V + uSunDir);
+        float a = uTime * (0.8 + 2.2 * aSeed) + aSeed * 90.0;
+        vec3 n = normalize(vec3(sin(a), cos(a * 0.73 + aSeed * 21.0), sin(a * 1.31 + 1.7)));
+        float flash = pow(abs(dot(n, H)), 160.0) * 24.0;
+        float glow = pow(max(dot(-V, uSunDir), 0.0), 12.0) * 0.25;
+        vGlint = (flash + glow) * uDustSun * smoothstep(0.8, 3.0, d) * (1.0 - smoothstep(uR * 0.55, uR, length(p - cameraPosition)));
+        gl_Position = projectionMatrix * mv;
+        gl_PointSize = vGlint > 0.004 ? clamp(0.012 * uScale / d, 1.5, 3.5) : 0.0;
+      }`,
+    fragmentShader: /* glsl */`
+      uniform vec3 uSunColor;
+      varying float vGlint;
+      void main() {
+        vec2 d = gl_PointCoord - 0.5;
+        float r2 = dot(d, d) * 4.0;
+        if (r2 > 1.0) discard;
+        gl_FragColor = vec4(uSunColor * vGlint * (1.0 - r2), 1.0);
+        #include <tonemapping_fragment>
+        #include <encodings_fragment>
+      }`,
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  });
+  DUST.points = new THREE.Points(geo, mat);
+  DUST.points.frustumCulled = false;
+  DUST.points.renderOrder = 21;
+  scene.add(DUST.points);
+}
+function updateDust() {
+  // (in shade of the valley walls or the trees around the camera, the crystals don't flash)
+  const c = camera.position, target = terrainSunAt(c.x, c.z);
+  DUST.sun.value += (target - DUST.sun.value) * 0.1;
+  DUST.points.material.uniforms.uScale.value = SPRAY.points.material.uniforms.uScale.value;
+}
 function sprayEmit(x, y, z, vx, vy, vz, life, size, lit) {
   const i = SPRAY.head;
   SPRAY.head = (SPRAY.head + 1) % VISUAL.SPRAY_MAX;
@@ -3757,7 +3875,7 @@ const FX = {
  * leg compression, crash) and joints ease toward it. Crashes use a tumble about a random axis and
  * a splayed, limp pose, then the skier gets back up.
  */
-const SK = { root: null, joints: {}, pose: null, tumbleQ: new THREE.Quaternion() };
+const SK = { root: null, joints: {}, pose: null, tumbleQ: new THREE.Quaternion(), lastEdgeSign: 0, plantT: 9, plantSide: 1 };
 const SHIN = 0.46, THIGH = 0.44;
 // Rounded limb segment: a lathed capsule from y = 0 (radius r0) to y = len (radius r1).
 function capsuleGeo(r0, r1, len, seg = 10) {
@@ -3802,11 +3920,14 @@ function skiGeo() {
 }
 function buildSkier() {
   // (fog, shadow-box fade and terrain-scale shadows like everything else)
-  const mat = (c, r, m = 0, extra = {}) => makePlainFogMaterial(Object.assign({ color: c, roughness: r, metalness: m }, extra), 'skier');
+  const mat = (c, r, m = 0, extra = {}) => makePlainFogMaterial(Object.assign({ color: new THREE.Color(c).convertSRGBToLinear(), roughness: r, metalness: m }, extra), 'skier');
+  // clothing: quilted insulated jacket (baffles every ~9 cm), shell pants, fleece gloves
   const M = {
-    jacket: mat(0xc8301f, 0.58), jacket2: mat(0xeceae4, 0.6), pants: mat(0x1b2230, 0.74), boot: mat(0x2b303b, 0.3),
-    ski: mat(0xffffff, 0.3, 0, { vertexColors: true }), helmet: mat(0xf0f0ee, 0.25), strap: mat(0x15171b, 0.7),
-    goggle: mat(0xff9a30, 0.05, 1.0), glove: mat(0x14161a, 0.8), pole: mat(0xc8ccd2, 0.28, 0.9), skin: mat(0xc98e6c, 0.62),
+    jacket: makeFabricMaterial(0xc2261b, 0.82, 11, 0.6), jacket2: makeFabricMaterial(0xe9e7e1, 0.8, 11, 0.5),
+    sleeve: makeFabricMaterial(0xc2261b, 0.82, 12.5, 0.6), hood: makeFabricMaterial(0xc2261b, 0.85, 0, 0.6),
+    pants: makeFabricMaterial(0x2b3548, 0.86, 0, 0.8), glove: makeFabricMaterial(0x1d2026, 0.85, 0, 0.5),
+    boot: mat(0x2b303b, 0.3), ski: mat(0xffffff, 0.3, 0, { vertexColors: true }), helmet: mat(0xf0f0ee, 0.25), strap: mat(0x15171b, 0.7),
+    goggle: mat(0xff9a30, 0.05, 1.0), pole: mat(0xc8ccd2, 0.28, 0.9), skin: mat(0xc98e6c, 0.62),
     buckle: mat(0x9aa0aa, 0.25, 0.9),
   };
   const mesh = (geo, m) => { const o = new THREE.Mesh(geo, m); o.castShadow = true; o.receiveShadow = true; return o; };
@@ -3830,9 +3951,10 @@ function buildSkier() {
   const legs = [];
   for (const side of [1, -1]) {
     const ankle = new THREE.Group(); ankle.position.set(side * 0.12, 0.17, -0.03); lean.add(ankle);
-    ankle.add(mesh(capsuleGeo(0.072, 0.078, SHIN), M.pants));                        // baggy ski pants over the boot cuff
+    // baggy ski pants, flared over the boot cuff
+    ankle.add(mesh(latheGeo([[0, -0.03], [0.094, -0.02], [0.092, 0.05], [0.082, 0.16], [0.08, 0.3], [0.088, SHIN - 0.03], [0.075, SHIN + 0.04], [0, SHIN + 0.06]], 12), M.pants));
     const knee = new THREE.Group(); knee.position.y = SHIN; ankle.add(knee);
-    knee.add(mesh(capsuleGeo(0.082, 0.094, THIGH), M.pants));
+    knee.add(mesh(capsuleGeo(0.09, 0.1, THIGH), M.pants));
     const hip = new THREE.Group(); hip.position.y = THIGH; knee.add(hip);
     legs.push({ ankle, knee, hip });
   }
@@ -3844,9 +3966,12 @@ function buildSkier() {
   const torso = new THREE.Group(); torso.position.y = 0.06; pelvis.add(torso); J.torso = torso;
   // insulated jacket: waist -> chest -> rounded shoulders, a little flattened front to back
   // (the jacket hangs down over the hips, as real ski jackets do)
-  const chest = mesh(latheGeo([[0, -0.1], [0.168, -0.095], [0.18, 0.0], [0.185, 0.12], [0.19, 0.28], [0.205, 0.43], [0.19, 0.52], [0.12, 0.585], [0.06, 0.6], [0, 0.6]], 16), M.jacket);
-  chest.scale.z = 0.72; torso.add(chest);
-  const yoke = mesh(latheGeo([[0.19, 0.3], [0.207, 0.36], [0.2, 0.41]], 16), M.jacket2); yoke.scale.z = 0.735; torso.add(yoke);
+  const chest = mesh(latheGeo([[0, -0.13], [0.178, -0.125], [0.192, -0.06], [0.19, 0.05], [0.197, 0.2], [0.212, 0.34], [0.224, 0.44], [0.207, 0.52], [0.13, 0.585], [0.07, 0.605], [0, 0.61]], 18), M.jacket);
+  chest.scale.z = 0.74; torso.add(chest);
+  const yoke = mesh(latheGeo([[0.206, 0.3], [0.222, 0.36], [0.227, 0.41]], 18), M.jacket2); yoke.scale.z = 0.75; torso.add(yoke);
+  // the hood, rolled up behind the collar
+  const hood = mesh(new THREE.TorusBufferGeometry(0.1, 0.045, 8, 16, Math.PI), M.hood);
+  hood.rotation.x = -Math.PI / 2; hood.position.set(0, 0.545, -0.005); hood.scale.set(1.05, 0.85, 1); torso.add(hood);
   const collar = mesh(capsuleGeo(0.07, 0.065, 0.06, 10), M.strap); collar.position.y = 0.55; torso.add(collar);   // neck gaiter
   const neck = new THREE.Group(); neck.position.y = 0.58; torso.add(neck); J.neck = neck;
   const head = mesh(new THREE.SphereBufferGeometry(0.1, 14, 10), M.skin); head.position.set(0, 0.1, 0.01); neck.add(head);
@@ -3857,9 +3982,10 @@ function buildSkier() {
   const arms = [];
   for (const side of [1, -1]) {
     const sh = new THREE.Group(); sh.position.set(side * 0.2, 0.47, 0); torso.add(sh);
-    const upper = mesh(capsuleGeo(0.06, 0.066, 0.28), M.jacket); upper.rotation.x = Math.PI; sh.add(upper);     // hangs down
+    const upper = mesh(capsuleGeo(0.068, 0.074, 0.28), M.sleeve); upper.rotation.x = Math.PI; sh.add(upper);     // hangs down
     const elbow = new THREE.Group(); elbow.position.y = -0.29; sh.add(elbow);
-    const fore = mesh(capsuleGeo(0.05, 0.058, 0.25), M.jacket); fore.rotation.x = Math.PI; elbow.add(fore);
+    const fore = mesh(capsuleGeo(0.056, 0.066, 0.24), M.sleeve); fore.rotation.x = Math.PI; elbow.add(fore);
+    const cuff = mesh(capsuleGeo(0.052, 0.058, 0.06), M.glove); cuff.rotation.x = Math.PI; cuff.position.y = -0.225; elbow.add(cuff);   // glove gauntlet
     const hand = new THREE.Group(); hand.position.y = -0.3; elbow.add(hand);
     const mitt = mesh(new THREE.SphereBufferGeometry(0.052, 10, 8), M.glove); mitt.scale.set(1, 1.25, 1.35); hand.add(mitt);
     const pole = new THREE.Group(); hand.add(pole);
@@ -3873,13 +3999,14 @@ function buildSkier() {
   scene.add(root);
   SK.root = root;
   SK.materials = M;
-  SK.pose = { ankle: 0.32, knee: 0.62, torso: 0.42, lean: 0, counter: 0, armF: 0.55, armOut: 0.25, elbow: 0.9, pole: 0.5, skiSplay: 0, edge: 0, limp: 0 };
+  SK.pose = { ankle: 0.42, knee: 0.9, torso: 0.5, lean: 0, counter: 0, armF: 0.72, armOut: 0.3, elbow: 1.1, pole: 0.5, skiSplay: 0, edge: 0, limp: 0 };
 }
 const _up = new THREE.Vector3(), _fw = new THREE.Vector3(), _lf = new THREE.Vector3(), _basis = new THREE.Matrix4(), _qa = new THREE.Quaternion();
 function poseSkier(dt, rp, rpsi) {
   const s = skier, P = SK.pose, J = SK.joints;
-  // --- targets from the physics state
-  let t = { ankle: 0.32, knee: 0.62, torso: 0.42, armF: 0.55, armOut: 0.22, elbow: 0.9, pole: 0.45, limp: 0 };
+  // --- targets from the physics state (an athletic stance: ankles and knees flexed, hips over the
+  // feet, hands forward and wide)
+  let t = { ankle: 0.42, knee: 0.9, torso: 0.5, armF: 0.72, armOut: 0.3, elbow: 1.1, pole: 0.5, limp: 0 };
   const tk = s.tuck;
   t.ankle = lerp(t.ankle, 0.62, tk); t.knee = lerp(t.knee, 1.55, tk); t.torso = lerp(t.torso, 1.2, tk);
   t.armF = lerp(t.armF, 1.25, tk); t.armOut = lerp(t.armOut, 0.12, tk); t.elbow = lerp(t.elbow, 1.9, tk); t.pole = lerp(t.pole, 1.35, tk);
@@ -3934,11 +4061,19 @@ function poseSkier(dt, rp, rpsi) {
   J.torso.rotation.x = P.torso - thighWorld;
   J.torso.rotation.z = P.lean * 0.35;                               // angulation: upper body stays more upright
   J.neck.rotation.x = -P.torso * 0.75;
+  // pole plant: as each new turn starts (the edges roll over), the inside pole swings forward and
+  // touches down ahead of the boots
+  const eSign = Math.abs(s.edge) > 0.12 ? Math.sign(s.edge) : 0;
+  if (eSign && eSign !== SK.lastEdgeSign && s.mode === 'ski' && s.grounded && s.tuck < 0.5 && !s.braking) { SK.plantT = 0; SK.plantSide = eSign; }
+  if (eSign) SK.lastEdgeSign = eSign;
+  SK.plantT += dt;
+  const plant = SK.plantT < 0.5 ? Math.sin(Math.PI * SK.plantT / 0.5) : 0;
   for (let i = 0; i < 2; i++) {
     const A = J.arms[i], side = i === 0 ? 1 : -1;
-    A.sh.rotation.set(-P.armF, 0, side * P.armOut);
-    A.elbow.rotation.x = -P.elbow * 0.8;
-    A.pole.rotation.set(-0.9 + P.pole + P.torso * 0.6, 0, side * 0.08);
+    const pl = (SK.plantSide > 0) === (i === 0) ? plant : 0;      // (edge > 0: a left turn, left arm inside)
+    A.sh.rotation.set(-P.armF - 0.3 * pl, 0, side * P.armOut);
+    A.elbow.rotation.x = -P.elbow * 0.8 + 0.25 * pl;
+    A.pole.rotation.set(-0.9 + P.pole + P.torso * 0.6 - 0.6 * pl, 0, side * 0.08);
   }
 }
 
@@ -4413,6 +4548,7 @@ function frame(now) {
   syncBackground();
   updateFarField(camera.position.z, 1.5);
   updateTerrainShadows(camera.position.x, camera.position.z);
+  updateDust();
   _ahead.copy(renderPos).addScaledVector(CAM.dir, 26);
   updateSun(_ahead);
   SPRAY.points.material.uniforms.uNow.value = simTime + (st === 'running' ? acc : 0);
@@ -4435,7 +4571,7 @@ async function boot() {
   buildColumns();
   status('Painting snow, rock and sky textures…');
   await buildTextures((p) => status(`Painting snow, rock and sky textures… ${Math.round(p * 100)}%`));
-  initPools(); initSpray(); initTracks(); buildSkier(); initFarField();
+  initPools(); initSpray(); initDust(); initTracks(); buildSkier(); initFarField();
   scene.add(world.group);
   applyLight(Game.light);
   initInput(); UI.init();
