@@ -3406,6 +3406,32 @@ function makeTreeGeometry(seed, tiers, spokes, width, underside, cards = 0, stat
   g.computeBoundingSphere();
   return g;
 }
+// Distant spruce (a few hundred metres out, 10-40 px tall): what reads is a dark, snow-flecked
+// spire with branches down to the snow - four overlapping cones, no visible trunk (24 triangles).
+function makeFarTreeGeometry() {
+  const P = [], N = [], C = [], S = [], UV = [], I = [];
+  const [cu0, cu1, cv0, cv1] = ATLAS.core;
+  const sides = 6;
+  for (const [y0, y1, r] of [[0.0, 0.5, 0.23], [0.22, 0.7, 0.18], [0.44, 0.87, 0.13], [0.64, 1.0, 0.075]]) {
+    const apex = P.length / 3, slope = r / (y1 - y0), nl = Math.hypot(1, slope);
+    P.push(0, y1, 0); N.push(0, 1, 0); C.push(1, 1, 1); S.push(0.75); UV.push((cu0 + cu1) / 2, cv0);
+    for (let k = 0; k <= sides; k++) {
+      const a = (k / sides) * Math.PI * 2 + y0 * 7;
+      P.push(Math.cos(a) * r, y0, Math.sin(a) * r); N.push(Math.cos(a) / nl, slope / nl, Math.sin(a) / nl);
+      C.push(0.75, 0.75, 0.75); S.push(0.4); UV.push(lerp(cu0, cu1, k / sides), cv1);
+    }
+    for (let k = 0; k < sides; k++) I.push(apex, apex + 2 + k, apex + 1 + k);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(P, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(N, 3));
+  g.setAttribute('color', new THREE.Float32BufferAttribute(C, 3));
+  g.setAttribute('aSnow', new THREE.Float32BufferAttribute(S, 1));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(UV, 2));
+  g.setIndex(I);
+  g.computeBoundingSphere();
+  return g;
+}
 // Boulder: a displaced icosahedron, flat-shaded for a chipped, faceted silhouette.
 function makeRockGeometry(seed) {
   const g = new THREE.IcosahedronBufferGeometry(1, 1);
@@ -3442,7 +3468,7 @@ function initPools() {
     // mid distance: fewer, straight branch cards (a solid-coned simplification reads as stacked umbrellas)
     POOLS.treeMid.push(makePool(makeTreeGeometry(seed, Math.ceil(tiers * 0.8), 4, width, false, 5, 1), treeMat, 2600, false));
   });
-  POOLS.treeFar = makePool(makeTreeGeometry(3, 3, 3, 0.21, false), treeMat, 16000, false);
+  POOLS.treeFar = makePool(makeFarTreeGeometry(), treeMat, 16000, false);
   for (let i = 0; i < 3; i++) {
     const g = makeRockGeometry(i + 1);
     POOLS.rockNear.push(makePool(g, rockMat, 700, true));
