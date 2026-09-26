@@ -857,20 +857,24 @@ function populateSegment(seg, course, gatesOn) {
       addTree(center + u, z, u, a, hw, a < hw - 3 ? 'island' : a < hw + 14 ? 'edge' : 'forest', k);
     }
   }
-  // the valley walls: sparser, bigger cells further out
+  // the valley walls, ~300 m up each side: sparser, bigger cells further out (no trees on faces
+  // too steep to hold them - those are rock)
   const CELL2 = 7.5;
   for (let cz = Math.floor(z0 / CELL2); cz * CELL2 < z1; cz++) {
     course.sample((cz + 0.5) * CELL2, p);
     const hw = p.halfW;
     for (const sideSign of [-1, 1]) {
-      for (let cu = 0; cu * CELL2 < 110; cu++) {
+      for (let cu = 0; cu * CELL2 < 270; cu++) {
         const k = (cu * 83492791) ^ (cz * 2654435) ^ (sideSign > 0 ? 0x5bd1e995 : 0);
         const u = sideSign * (hw + 34 + (cu + 0.15 + 0.7 * hash2i(cu * sideSign, cz, salt + 32)) * CELL2);
         const z = (cz + 0.15 + 0.7 * hash2i(cu * sideSign, cz, salt + 33)) * CELL2;
         if (z < z0 || z >= z1) continue;
         if (hash2i(cu * sideSign, cz, salt + 31) >= 0.62 * course.forestDensity(p.center + u, z)) continue;
         if (featureBlocks(course, u, z)) continue;
-        addTree(p.center + u, z, u, Math.abs(u), hw, 'forest', k);
+        const x = p.center + u, e = 2.5;
+        const gx = (course.height(x + e, z) - course.height(x - e, z)) / (2 * e), gz = (course.height(x, z + e) - course.height(x, z - e)) / (2 * e);
+        if (gx * gx + gz * gz > 0.72) continue;                     // steeper than ~40 deg: bare rock / snow
+        addTree(x, z, u, Math.abs(u), hw, 'forest', k);
       }
     }
   }
@@ -1490,7 +1494,9 @@ float flTreeDots(vec2 p, float dens, vec3 N) {
   float disc = 1.0 - smoothstep(0.26 - px, 0.26 + px, length(f - 0.5 - (h.xy - 0.5) * 0.3));
   float shape = mix(disc, tri, smoothstep(0.05, 0.25, tilt));
   float on = step(h.z * 0.6 + h.x * 0.4, dens);
-  return mix(shape * on, dens * mix(0.21, L * W, smoothstep(0.05, 0.25, tilt)), smoothstep(0.12, 0.35, px));
+  // (individual crowns only while they are big on screen; further away a mottled canopy)
+  float canopy = dens * mix(0.21, L * W, smoothstep(0.05, 0.25, tilt));
+  return mix(shape * on, canopy, smoothstep(0.05, 0.14, px));
 }
 `;
 
@@ -1817,6 +1823,109 @@ function worleyF1(u, v, cells, salt) {
   }
   return Math.sqrt(best);
 }
+/*
+ * Spruce branch atlas (1024 x 512, RGBA, painted on a canvas):
+ *   rows   0-255            a branch seen from above: woody main twig, side twigs, thousands of
+ *                           short dark needles all round, clumps of snow lying on top
+ *   rows 256-511, x < 736   the same branch seen from the side: drooping twig, needles hanging in
+ *                           a ragged curtain below it, a lumpy cap of snow along the top
+ *   x 740-763 (bottom)      plain white (trunks: coloured by their vertex colour)
+ *   x 768-1023 (bottom)     an opaque mat of needles for the solid inner crown
+ * Alpha is cut out by the tree material (alpha test). Colour is bled into the transparent texels so
+ * smaller mip levels don't darken the edges of needles and snow.
+ */
+function makeBranchAtlas() {
+  const W = 1024, H = 512, cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+  const g = cv.getContext('2d'), rnd = mulberry32(90210);
+  g.lineCap = 'round';
+  const green = (k) => { const b = (0.72 + 0.56 * rnd()) * k; return `rgb(${Math.round(16 * b)},${Math.round(38 * b)},${Math.round(25 * b)})`; };
+  const stroke = (x0, y0, x1, y1, w, col) => { g.strokeStyle = col; g.lineWidth = w; g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1, y1); g.stroke(); };
+  const needles = (x0, y0, x1, y1, len, per, below) => {         // short needles along a twig, angled forward
+    const L = Math.hypot(x1 - x0, y1 - y0), ux = (x1 - x0) / L, uy = (y1 - y0) / L;
+    for (let i = 0, n = Math.floor(L * per); i < n; i++) {
+      const t = rnd(), px = x0 + (x1 - x0) * t, py = y0 + (y1 - y0) * t;
+      const side = below && rnd() < below ? 1 : rnd() < 0.5 ? -1 : 1;
+      const a = side * (0.55 + rnd() * 0.75), c = Math.cos(a), sn = Math.sin(a);
+      const l = len * (0.65 + 0.7 * rnd()) * (1 - 0.3 * t);
+      stroke(px, py, px + (ux * c - uy * sn) * l, py + (ux * sn + uy * c) * l, 1.7, green(rnd() < 0.12 ? 1.5 : 1));
+    }
+  };
+  const snowBlob = (x, y, r, flat) => {
+    for (let j = 0; j < 4; j++) {
+      const bx = x + (rnd() - 0.5) * r, by = y + (rnd() - 0.5) * r * (flat ? 0.25 : 0.6), br = r * (0.5 + 0.5 * rnd());
+      const grd = g.createRadialGradient(bx, by, br * 0.15, bx, by, br);
+      grd.addColorStop(0, 'rgba(244,247,252,1)'); grd.addColorStop(0.6, 'rgba(226,234,245,1)'); grd.addColorStop(1, 'rgba(205,218,236,0)');
+      g.fillStyle = grd; g.beginPath(); g.ellipse(bx, by, br * (flat ? 1.5 : 1), br * (flat ? 0.6 : 1), 0, 0, Math.PI * 2); g.fill();
+    }
+  };
+  // --- top view
+  const twig = (x) => 128 + 7 * Math.sin(x / 170 + 0.4);
+  const sideT = [];
+  for (let i = 0, x = 26; x < 970; i++, x += 40 + rnd() * 26) {
+    const side = i % 2 ? 1 : -1, len = (118 - 70 * x / 1024) * (0.75 + 0.5 * rnd()), a = side * (0.75 + rnd() * 0.3);
+    sideT.push([x, twig(x), x + Math.cos(a) * len, twig(x) + Math.sin(a) * len]);
+  }
+  for (const [x0, y0, x1, y1] of sideT) { stroke(x0, y0, x1, y1, 2.2, '#3a2a1e'); needles(x0, y0, x1, y1, 15, 1.5); }
+  for (let x = 0; x < 1010; x += 6) stroke(x, twig(x), x + 6, twig(x + 6), 5 - 3.5 * x / 1024, '#3d2c1f');
+  needles(0, twig(0), 1010, twig(1010), 17, 1.2);
+  // snow lies in a few big soft pillows along the main twig, smaller pads on some side twigs
+  for (let x = 40; x < 900; x += 70 + rnd() * 70) snowBlob(x, twig(x), (26 + 14 * rnd()) * (1 - x / 1700));
+  for (const [x0, y0, x1, y1] of sideT) if (rnd() < 0.4) snowBlob(lerp(x0, x1, 0.35), lerp(y0, y1, 0.35), 12 + 8 * rnd());
+  // --- side view
+  const sy = (x) => 256 + 58 + 42 * (x / 736) * (x / 736);
+  for (let x = 0; x < 730; x += 2.5) {
+    const y = sy(x);
+    for (let k = 0; k < 3; k++) {
+      const a = 0.45 + rnd() * 1.05, l = (13 + rnd() * 15) * (1 - 0.35 * x / 736), dep = rnd() * rnd() * 95 * (1 - 0.4 * x / 736);
+      stroke(x + rnd() * 3, y + dep * 0.6, x + Math.cos(a) * l, y + dep * 0.6 + Math.sin(a) * l, 1.7, green(1));
+    }
+    if (rnd() < 0.3) stroke(x, y, x + 8 + rnd() * 8, y - 5 - rnd() * 8, 1.6, green(1.2));
+  }
+  for (let x = 0; x < 730; x += 5) stroke(x, sy(x), x + 5, sy(x + 5), 4 - 2.5 * x / 736, '#3d2c1f');
+  // a continuous, lumpy cap of snow along the top of the branch (with the odd gap)
+  g.fillStyle = 'rgba(238,243,250,1)';
+  for (let x = 8, gap = 0; x < 690; x += 5) {
+    if (gap > 0) { gap -= 5; continue; }
+    if (rnd() < 0.04) { gap = 20 + rnd() * 40; continue; }
+    const r = 7 + 6 * Math.sin(x * 0.045 + 1.3) * Math.sin(x * 0.021) + 4 * rnd();
+    g.beginPath(); g.ellipse(x, sy(x) - r * 0.35, r * 1.3, r * 0.62, 0, 0, Math.PI * 2); g.fill();
+  }
+  // --- plain white (trunks) and the inner-crown needle mat
+  g.fillStyle = '#ffffff'; g.fillRect(740, 488, 24, 24);
+  g.save(); g.beginPath(); g.rect(768, 256, 256, 256); g.clip();
+  g.fillStyle = 'rgb(14,31,21)'; g.fillRect(768, 256, 256, 256);
+  for (let i = 0; i < 2800; i++) {
+    const x = 768 + rnd() * 256, y = 256 + rnd() * 256, a = rnd() * 6.283, l = 8 + rnd() * 10;
+    stroke(x, y, x + Math.cos(a) * l, y + Math.sin(a) * l, 1.6, green(rnd() < 0.2 ? 1.4 : 0.9));
+  }
+  g.restore();
+  // bleed colour into transparent texels (4 passes), then upload as a data texture (keeps the
+  // bled colour, which a canvas upload would lose to premultiplied alpha)
+  const img = g.getImageData(0, 0, W, H), d = img.data;
+  for (let pass = 0; pass < 4; pass++) {
+    const src = new Uint8ClampedArray(d);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const i = (y * W + x) * 4;
+        if (src[i + 3] > 0) continue;
+        let r = 0, gg = 0, b = 0, n = 0;
+        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+          const xx = x + dx, yy = y + dy;
+          if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
+          const j = (yy * W + xx) * 4;
+          if (src[j + 3] > 0) { r += src[j]; gg += src[j + 1]; b += src[j + 2]; n++; }
+        }
+        if (n) { d[i] = r / n; d[i + 1] = gg / n; d[i + 2] = b / n; d[i + 3] = 1; }
+      }
+    }
+  }
+  const tex = new THREE.DataTexture(new Uint8Array(d), W, H, THREE.RGBAFormat);
+  tex.generateMipmaps = true; tex.minFilter = THREE.LinearMipmapLinearFilter; tex.magFilter = THREE.LinearFilter;
+  tex.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+  tex.encoding = THREE.sRGBEncoding;
+  tex.needsUpdate = true;
+  return tex;
+}
 async function buildTextures(progress) {
   // Snow micro-relief (tile 1.6 m, 3 mm per texel): rounded clumps at two scales - clusters of
   // crystals ~3 cm across and lumps ~11 cm across, as left by a groomer's tiller or settled powder
@@ -1842,6 +1951,8 @@ async function buildTextures(progress) {
   TEX.pillow = canvasTexture(heightToCanvas(256,
     (u, v) => 0.6 * pillow(worleyF1(u, v, 8, 121)) + 0.4 * pillow(worleyF1(u, v, 3, 123)),
     6, (u, v) => pfbm(u, v, 4, 4, 3, 125)), false);
+  progress(0.45); await nextTick();
+  TEX.branch = makeBranchAtlas();
   progress(0.55); await nextTick();
   // rock: grey granite with darker cracks and a hint of lichen (triplanar, tile = 6 m)
   {
@@ -2022,7 +2133,7 @@ function snowCompile(shader) {
       flRockCol = sRGBToLinear(texture2D(uRock, P.zy)).rgb * w.x + sRGBToLinear(texture2D(uRock, P.xz)).rgb * w.y + sRGBToLinear(texture2D(uRock, P.xy)).rgb * w.z;
     }
     float flAway = abs(vSnow.x) - vSnow.y;
-    float flForestD = smoothstep(118.0, 150.0, flAway) * smoothstep(0.34, 0.6, flBig.b + 0.3 * (flWi.b - 0.5)) * (1.0 - flRockAmt);
+    float flForestD = smoothstep(300.0, 330.0, flAway) * smoothstep(0.34, 0.6, flBig.b + 0.3 * (flWi.b - 0.5)) * (1.0 - flRockAmt);   // beyond the modelled trees
     float flForest = flTreeDots(vTC, flForestD * 0.9, flN);
     vec3 flForestCol = mix(vec3(0.02, 0.04, 0.028), vec3(0.62, 0.66, 0.72), 0.16 + 0.2 * smoothstep(0.5, 0.78, flGr.b));
 
@@ -2145,7 +2256,7 @@ float flVN3(vec3 x) {
 }
 `;
 function makeTreeMaterial() {
-  const m = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.9, metalness: 0 });
+  const m = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.9, metalness: 0, map: TEX.branch, alphaTest: 0.5, side: THREE.DoubleSide });
   m.onBeforeCompile = (shader) => {
     const vary = 'varying float vSnowCap;\nvarying vec3 vTreeI;\nvarying vec3 vTN;\nvarying vec3 vTP;\n';
     patchCommon(shader, 'attribute float aSnow;\n' + vary, vary + VNOISE3_GLSL);
@@ -2168,12 +2279,23 @@ function makeTreeMaterial() {
     shader.vertexShader = v;
     let f = shader.fragmentShader;
     f = hook(f, '#include <color_fragment>', `
-      vec3 flNeedle = vColor * vTreeI.x * mix(vec3(0.85, 1.0, 1.1), vec3(1.2, 1.0, 0.75), vTreeI.y);
+      // alpha-tested needles thin out in small mip levels: raise alpha with the mip level
+      vec2 flTs = vUv * vec2(1024.0, 512.0);
+      float flLod = max(0.5 * log2(max(dot(dFdx(flTs), dFdx(flTs)), dot(dFdy(flTs), dFdy(flTs)))), 0.0);
+      diffuseColor.a *= 1.0 + flLod * 0.3;
+      vec3 flTex = diffuseColor.rgb;                                   // atlas: needles, twigs, painted snow
+      float flTexSnow = smoothstep(0.2, 0.5, dot(flTex, vec3(0.3, 0.5, 0.2))) * step(0.2, vColor.g);
+      // snow lies on top of a branch: on the lying (top-view) cards it only shows from above
+      flTexSnow *= mix(1.0, float(gl_FrontFacing), step(vUv.y, 0.5));
+      vec3 flNeedle = flTex * vColor * vTreeI.x * mix(vec3(0.85, 1.0, 1.1), vec3(1.2, 1.0, 0.75), vTreeI.y);
       float flN1 = flVN3(vTP * 36.0 + vTreeI.y * 23.0), flN2 = flVN3(vTP * 105.0 + 7.0);
       float flSnow = vSnowCap * smoothstep(0.25, 0.75, normalize(vTN).y + (flN1 - 0.5) * 0.95 + (flN2 - 0.5) * 0.35 - (1.0 - vTreeI.z) * 0.45);
+      flSnow = max(flSnow, flTexSnow * smoothstep(0.2, 0.55, vTreeI.z));   // lightly laden trees lose their painted snow
       diffuseColor.rgb = mix(flNeedle, vec3(0.8, 0.84, 0.9), flSnow);
       float flRough = mix(0.9, 0.72, flSnow);`, 'tree-col');
     f = hook(f, '#include <roughnessmap_fragment>', 'float roughnessFactor = flRough;', 'tree-rough');
+    // foliage normals point out of the crown; don't flip them on the cards' back faces
+    f = hook(f, '#include <normal_fragment_maps>', 'normal = normalize(vNormal);', 'tree-normal');
     shader.fragmentShader = f;
   };
   m.customProgramCacheKey = () => 'fl-tree';
@@ -2585,7 +2707,7 @@ function farCover(x, z, p) {
   if (a < hw - 3) c = z < 40 ? 0 : p.treeIn * 1.4;
   else if (a < hw + 14) c = z < 20 ? 0.1 : p.treeEdge * 1.4;
   else if (a < hw + 34) c = 0.84 * course.forestDensity(x, z);
-  else if (a < hw + 144) c = 0.4 * course.forestDensity(x, z);
+  else if (a < hw + 304) c = 0.4 * course.forestDensity(x, z);
   else c = 0;
   return clamp(c, 0, 1);
 }
@@ -2738,7 +2860,7 @@ function makeFarMaterial() {
       // general forest pattern, so they don't draw converging stripes up the far valley.
       float flFarK = smoothstep(3500.0, 6500.0, length(vFW - cameraPosition));
       float flAway = mix(vFar.x, 1000.0, flFarK);
-      float flPaint = smoothstep(118.0, 150.0, flAway) * smoothstep(0.34, 0.6, flBig.b + 0.3 * (flWi.b - 0.5));
+      float flPaint = smoothstep(300.0, 330.0, flAway) * smoothstep(0.34, 0.6, flBig.b + 0.3 * (flWi.b - 0.5));
       float flTreeLine = 1.0 - smoothstep(${(FAR.TREELINE - 160).toFixed(1)}, ${(FAR.TREELINE + 160).toFixed(1)}, vFar.y + (flHuge.g - 0.5) * 500.0);
       float flForest = flTreeDots(vFW.xz, max(flPaint * 0.9, vFar.z * (1.0 - flFarK)) * flTreeLine * (1.0 - flRockAmt), flN);
       vec3 flForestCol = mix(vec3(0.02, 0.04, 0.028), vec3(0.62, 0.66, 0.72), 0.16 + 0.2 * smoothstep(0.5, 0.78, flGrB));
@@ -2769,51 +2891,65 @@ function makeFarMaterial() {
  * enough to shift the tiers. Pools have fixed capacities, so nothing accumulates.
  */
 const POOLS = { treeNear: [], treeMid: [], treeFar: null, rockNear: [], rockFar: [], pole: null, flag: null };
-const TREE_COLORS = { bark: [0.034, 0.029, 0.026], needle: [0.012, 0.032, 0.018], needleLight: [0.026, 0.052, 0.03], needleDark: [0.006, 0.016, 0.01] };
+const TREE_COLORS = { bark: [0.034, 0.029, 0.026] };
 const mixc = (a, b, t) => [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
+// where things live in the branch atlas (see makeBranchAtlas)
+const ATLAS = { white: [0.7324, 0.978], core: [0.752, 0.994, 0.504, 0.996] };
 
 /*
- * Snowy conifer (spruce / fir) at unit height; instances scale it. A tapered trunk and whorls of
- * drooping branches. Each whorl is a star of alternating long and short branches (the ragged
- * silhouette) with a convex upper surface (trunk -> shoulder -> drooping tips) and a separate dark
- * underside. Per vertex: needle colour, and aSnow = how much snow that spot can hold (a lot on the
- * shoulders, a little on the tips, none underneath). Where snow actually lies is decided per pixel
- * in the tree shader (surface facing up + clumpy noise), see makeTreeMaterial.
+ * Snowy spruce at unit height; instances scale it. A tapered trunk, a solid inner crown (whorls
+ * with a star-shaped rim, textured with the atlas' needle mat) and, for the detailed tier, real
+ * BRANCHES: every whorl sprouts 8 branches, each a crossed pair of alpha-tested cards - one lying
+ * along the branch (the branch seen from above: twigs, needles, snow clumps) and one standing
+ * under it (seen from the side: the hanging curtain of needles with a cap of snow) - drooping
+ * toward the tip. Crossed cards give a ragged, see-through silhouette from any direction. Foliage
+ * normals point out of the crown (not the card planes), so the tree shades as a volume; branches
+ * darken toward the trunk (crown occlusion). Per vertex: colour = tint (bark colour for the trunk),
+ * aSnow = how much snow the solid crown can hold there (the cards carry their own painted snow).
  */
-function makeTreeGeometry(seed, tiers, spokes, width, underside) {
+function makeTreeGeometry(seed, tiers, spokes, width, underside, cards = 0) {
   const rnd = mulberry32(seed);
-  const P = [], C = [], S = [], I = [];
-  const v = (x, y, z, c, snow) => { P.push(x, y, z); C.push(c[0], c[1], c[2]); S.push(snow); return P.length / 3 - 1; };
+  const P = [], N = [], C = [], S = [], UV = [], I = [];
+  const v = (x, y, z, c, snow, u, w, nrm) => {
+    P.push(x, y, z); C.push(c[0], c[1], c[2]); S.push(snow); UV.push(u, w);
+    N.push(nrm ? nrm[0] : 0, nrm ? nrm[1] : 0, nrm ? nrm[2] : 0);
+    return P.length / 3 - 1;
+  };
+  const tint = () => { const k = 0.85 + 0.3 * rnd(); return [k * (0.95 + 0.1 * rnd()), k, k * (0.95 + 0.1 * rnd())]; };
+  const [cu0, cu1, cv0, cv1] = ATLAS.core;
   const sides = underside ? 6 : 4;
-  const t0 = P.length / 3;
   for (let i = 0; i <= sides; i++) {
-    const a = (i / sides) * Math.PI * 2, c = Math.cos(a), s = Math.sin(a);
-    v(c * 0.022, -0.05, s * 0.022, TREE_COLORS.bark, 0);
-    v(c * 0.005, 0.9, s * 0.005, TREE_COLORS.bark, 0);
+    const a = (i / sides) * Math.PI * 2, c = Math.cos(a), sn = Math.sin(a);
+    v(c * 0.022, -0.05, sn * 0.022, TREE_COLORS.bark, 0, ATLAS.white[0], ATLAS.white[1]);
+    v(c * 0.0025, 0.93, sn * 0.0025, TREE_COLORS.bark, 0, ATLAS.white[0], ATLAS.white[1]);
   }
-  for (let i = 0; i < sides; i++) { const a = t0 + i * 2; I.push(a, a + 1, a + 2, a + 1, a + 3, a + 2); }
-  const n = spokes * 2;
+  for (let i = 0; i < sides; i++) { const a = i * 2; I.push(a, a + 1, a + 2, a + 1, a + 3, a + 2); }
+  const n = spokes * 2, coreK = cards ? 0.84 : 1;
+  const whorls = [];
   for (let t = 0; t < tiers; t++) {
     const f = t / tiers;
     const apexY = lerp(0.13, 1.0, (t + 1) / tiers) + (rnd() - 0.5) * 0.015;
     const R = width * Math.pow(1 - f, 0.85) * (0.86 + 0.28 * rnd()) + 0.018;
     const D = R * (0.6 + 0.35 * rnd());                  // how far the tips hang below the whorl top
-    const phase = rnd() * Math.PI * 2;
-    const needle = mixc(TREE_COLORS.needle, TREE_COLORS.needleLight, rnd() * 0.7);
-    const apex = v(0, apexY, 0, needle, 1);
+    whorls.push({ apexY, R, D });
+    const phase = rnd() * Math.PI * 2, tc = tint();
+    // snow the solid crown can hold: little when branch cards carry the snow, and moderate on the
+    // simplified distant trees (from afar a snowy spruce still reads dark, flecked with white)
+    const cs = cards ? 0.35 : 0.6;
+    const apex = v(0, apexY, 0, tc, cs, lerp(cu0, cu1, 0.5), cv0);
     const mid = [], rimU = [], rimL = [], und = [];
     for (let k = 0; k < n; k++) {
       const long = k % 2 === 0;
       const a = phase + (k / n) * Math.PI * 2 + (rnd() - 0.5) * (Math.PI / n) * 0.8;
       const ca = Math.cos(a), sa = Math.sin(a);
-      const r = R * (long ? 1 : 0.56) * (0.84 + 0.32 * rnd());
+      const r = R * coreK * (long ? 1 : 0.56) * (0.84 + 0.32 * rnd());
       const tipY = apexY - D * (long ? 1 : 0.7) * (0.85 + 0.3 * rnd());
-      const c = mixc(needle, TREE_COLORS.needleLight, rnd() * 0.5);
-      mid.push(v(ca * r * 0.5, apexY - D * 0.28, sa * r * 0.5, c, long ? 0.95 : 0.8));
-      rimU.push(v(ca * r, tipY, sa * r, c, long ? 0.3 : 0.55));
+      const u = lerp(cu0, cu1, k / n);
+      mid.push(v(ca * r * 0.5, apexY - D * 0.28, sa * r * 0.5, tc, (long ? 0.95 : 0.8) * cs, u, lerp(cv0, cv1, 0.45)));
+      rimU.push(v(ca * r, tipY, sa * r, tc, (long ? 0.3 : 0.55) * cs, u, cv1));
       if (underside) {
-        rimL.push(v(ca * r, tipY, sa * r, TREE_COLORS.needleDark, 0));
-        und.push(v(ca * r * 0.4, tipY - D * 0.22 - 0.01, sa * r * 0.4, TREE_COLORS.needleDark, 0));
+        rimL.push(v(ca * r, tipY, sa * r, mixc(tc, [0, 0, 0], 0.5), 0, u, cv1));
+        und.push(v(ca * r * 0.4, tipY - D * 0.22 - 0.01, sa * r * 0.4, mixc(tc, [0, 0, 0], 0.5), 0, u, lerp(cv0, cv1, 0.6)));
       }
     }
     for (let k = 0; k < n; k++) {
@@ -2823,12 +2959,52 @@ function makeTreeGeometry(seed, tiers, spokes, width, underside) {
       if (underside) I.push(rimL[k], rimL[k1], und[k], rimL[k1], und[k1], und[k]);   // underside
     }
   }
+  // smooth normals for the solid parts (trunk + inner crown)
+  for (let i = 0; i < I.length; i += 3) {
+    const a = I[i] * 3, b = I[i + 1] * 3, c = I[i + 2] * 3;
+    const ux = P[b] - P[a], uy = P[b + 1] - P[a + 1], uz = P[b + 2] - P[a + 2];
+    const wx = P[c] - P[a], wy = P[c + 1] - P[a + 1], wz = P[c + 2] - P[a + 2];
+    const nx = uy * wz - uz * wy, ny = uz * wx - ux * wz, nz = ux * wy - uy * wx;
+    for (const q of [a, b, c]) { N[q] += nx; N[q + 1] += ny; N[q + 2] += nz; }
+  }
+  // branches: crossed, drooping cards
+  if (cards) {
+    for (const { apexY, R, D } of whorls) {
+      const phase = rnd() * Math.PI * 2;
+      for (let k = 0; k < cards; k++) {
+        const a = phase + (k / cards) * Math.PI * 2 + (rnd() - 0.5) * 0.5;
+        const dx = Math.cos(a), dz = Math.sin(a), ax = -dz, az = dx;          // along / across the branch
+        const len = R * (1.02 + 0.26 * rnd()), y0 = apexY - D * 0.22, droop = D * (0.8 + 0.45 * rnd());
+        const roll = (rnd() - 0.5) * 0.35;
+        const base = [], tipH = [], vt = [], vb = [];
+        for (let st = 0; st <= 2; st++) {
+          const fr = st / 2, r = lerp(0.02, len, fr), y = y0 - droop * Math.pow(fr, 1.6);
+          const hw = len * (0.13 + 0.28 * fr - 0.08 * fr * fr);
+          const shade = 0.55 + 0.45 * fr;                                         // darker toward the trunk
+          const nrm = [dx * (0.55 + 0.45 * fr), 0.62 - 0.25 * fr, dz * (0.55 + 0.45 * fr)];
+          const cx = dx * r, cz = dz * r, tc = mixc(tint(), [0, 0, 0], 1 - shade);
+          // horizontal card (top view: atlas rows 0-255)
+          base.push(v(cx + ax * hw, y + roll * hw, cz + az * hw, tc, 0, fr * 0.985, 0.02, nrm));
+          tipH.push(v(cx - ax * hw, y - roll * hw, cz - az * hw, tc, 0, fr * 0.985, 0.48, nrm));
+          // vertical card (side view: atlas rows 256-511, twig ~26% down from its top)
+          vt.push(v(cx, y + len * 0.13, cz, tc, 0, fr * 0.71, 0.505, nrm));
+          vb.push(v(cx, y - len * 0.37, cz, tc, 0, fr * 0.71, 0.93, nrm));
+        }
+        for (let st = 0; st < 2; st++) {
+          I.push(base[st], base[st + 1], tipH[st], tipH[st], base[st + 1], tipH[st + 1]);
+          I.push(vt[st], vt[st + 1], vb[st], vb[st], vt[st + 1], vb[st + 1]);
+        }
+      }
+    }
+  }
+  for (let i = 0; i < N.length; i += 3) { const l = Math.hypot(N[i], N[i + 1], N[i + 2]) || 1; N[i] /= l; N[i + 1] /= l; N[i + 2] /= l; }
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.Float32BufferAttribute(P, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(N, 3));
   g.setAttribute('color', new THREE.Float32BufferAttribute(C, 3));
   g.setAttribute('aSnow', new THREE.Float32BufferAttribute(S, 1));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(UV, 2));
   g.setIndex(I);
-  g.computeVertexNormals();
   g.computeBoundingSphere();
   return g;
 }
@@ -2859,11 +3035,15 @@ function initPools() {
   const treeMat = makeTreeMaterial(), rockMat = makeRockMaterial();
   // three species-ish variants: slender spruce, fuller fir, tall narrow spruce
   const variants = [[10, 0.2, 5], [9, 0.24, 7], [11, 0.18, 9]];
+  // shadows of the alpha-tested branches keep their ragged, see-through shape
+  const treeDepth = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking, map: TEX.branch, alphaTest: 0.5, side: THREE.DoubleSide });
   variants.forEach(([tiers, width, seed]) => {
-    POOLS.treeNear.push(makePool(makeTreeGeometry(seed, tiers, 7, width, true), treeMat, 1400, true));
+    const near = makePool(makeTreeGeometry(seed, tiers, 4, width, false, 11), treeMat, 1400, true);
+    near.customDepthMaterial = treeDepth;
+    POOLS.treeNear.push(near);
     POOLS.treeMid.push(makePool(makeTreeGeometry(seed, Math.ceil(tiers * 0.6), 4, width, false), treeMat, 2600, false));
   });
-  POOLS.treeFar = makePool(makeTreeGeometry(3, 3, 3, 0.21, false), treeMat, 9000, false);
+  POOLS.treeFar = makePool(makeTreeGeometry(3, 3, 3, 0.21, false), treeMat, 16000, false);
   for (let i = 0; i < 3; i++) {
     const g = makeRockGeometry(i + 1);
     POOLS.rockNear.push(makePool(g, rockMat, 700, true));
