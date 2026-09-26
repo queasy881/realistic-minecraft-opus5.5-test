@@ -1803,21 +1803,45 @@ function canvasTexture(cv, srgb) {
   t.encoding = srgb ? THREE.sRGBEncoding : THREE.LinearEncoding;
   return t;
 }
+// Periodic Worley F1 (distance to the nearest jittered feature point, in cell units) on [0,1)^2.
+function worleyF1(u, v, cells, salt) {
+  const x = u * cells, y = v * cells, xi = Math.floor(x), yi = Math.floor(y);
+  let best = 9;
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      const cx = xi + dx, cy = yi + dy, wx = ((cx % cells) + cells) % cells, wy = ((cy % cells) + cells) % cells;
+      const px = cx + 0.15 + 0.7 * hash2i(wx, wy, salt), py = cy + 0.15 + 0.7 * hash2i(wx, wy, salt + 1);
+      const d2 = (x - px) * (x - px) + (y - py) * (y - py);
+      if (d2 < best) best = d2;
+    }
+  }
+  return Math.sqrt(best);
+}
 async function buildTextures(progress) {
-  // fine snow grain: wind-packed crystals and tiny clumps (tile = 1.6 m)
-  TEX.grain = canvasTexture(heightToCanvas(256,
-    (u, v) => pfbm(u, v, 18, 18, 3, 101) * 0.6 + pfbm(u, v, 64, 64, 2, 102) * 0.4,
-    9, (u, v) => pfbm(u, v, 40, 40, 2, 103)), false);
-  progress(0.25); await nextTick();
-  // wind ripples / sastrugi: long, soft ridges across the slope (tile = 16 m) + large-scale albedo.
+  // Snow micro-relief (tile 1.6 m, 3 mm per texel): rounded clumps at two scales - clusters of
+  // crystals ~3 cm across and lumps ~11 cm across, as left by a groomer's tiller or settled powder
+  // (Worley-cell domes) - plus fine granular noise. B channel: brightness (clump tops a bit lighter).
+  const dome = (f) => { const t = clamp(f / 0.95, 0, 1); return 1 - t * t * (3 - 2 * t); };
+  TEX.grain = canvasTexture(heightToCanvas(512,
+    (u, v) => 0.5 * dome(worleyF1(u, v, 50, 111)) + 0.35 * dome(worleyF1(u, v, 14, 113)) + 0.15 * pfbm(u, v, 96, 96, 2, 102),
+    5.5, (u, v) => 0.35 + 0.4 * dome(worleyF1(u, v, 50, 111)) + 0.25 * pfbm(u, v, 40, 40, 2, 103)), false);
+  progress(0.3); await nextTick();
+  // Wind-sculpted surface (tile 16 m): irregular, elongated sastrugi crests of varying length
+  // (ridged anisotropic noise with domain warping), plus large-scale albedo variation in B.
   // (All tile sizes divide 4096 m, the period at which segment texture coordinates wrap, so the
   // patterns stay continuous across that wrap and match the far field, which uses world x/z.)
   TEX.wind = canvasTexture(heightToCanvas(512,
     (u, v) => {
-      const w = pfbm(u, v, 3, 3, 3, 201);
-      const ripple = Math.sin((v * 22 + w * 6.0 + pfbm(u, v, 5, 2, 2, 202) * 2.0) * Math.PI * 2) * 0.5 + 0.5;
-      return ripple * 0.5 + pfbm(u, v, 6, 14, 3, 203) * 0.5;
-    }, 5, (u, v) => pfbm(u, v, 3, 3, 4, 204)), false);
+      const w = pfbm(u, v, 3, 3, 3, 201) - 0.5;
+      const r = 1 - Math.abs(2 * pfbm(u + w * 0.35, v + w * 0.1, 3, 18, 3, 205) - 1);
+      return r * r * 0.75 + pfbm(u, v, 6, 14, 3, 203) * 0.25;
+    }, 4, (u, v) => pfbm(u, v, 3, 3, 4, 204)), false);
+  // Powder pillows (tile 32 m): soft, rounded mounds of wind-deposited snow ~4 m and ~10 m across
+  // (smoothed Worley domes), the shapes fresh snow settles into over the terrain.
+  const pillow = (f) => { const t = clamp(f / 1.05, 0, 1); return Math.pow(1 - t * t, 1.6); };
+  TEX.pillow = canvasTexture(heightToCanvas(256,
+    (u, v) => 0.6 * pillow(worleyF1(u, v, 8, 121)) + 0.4 * pillow(worleyF1(u, v, 3, 123)),
+    6, (u, v) => pfbm(u, v, 4, 4, 3, 125)), false);
   progress(0.55); await nextTick();
   // rock: grey granite with darker cracks and a hint of lichen (triplanar, tile = 6 m)
   {
@@ -1889,21 +1913,73 @@ function patchCommon(shader, extraVertPars = '', extraFragPars = '') {
 }
 
 /*
- * SNOW. MeshStandardMaterial (physically based GGX + image-based light + PCF soft shadows),
- * extended in onBeforeCompile:
- *  - albedo: bright, very slightly blue-white with large-scale variation; glazed ice patches are
- *    greyer, bluer and much smoother; rock shows through on faces too steep to hold snow; the
- *    valley walls far from the run get a snowy-forest pattern where no trees are modelled
- *  - roughness ~0.66 (snow is rough, never plastic or metallic); groomed corduroy slightly
- *    smoother; ice ~0.16
- *  - normals: two procedural detail layers (fine grain, wind ripples) + groomer corduroy lines
- *  - SPARKLE: every ~3 cm cell of the surface holds one ice-crystal facet with a random tilt. When
- *    that facet mirrors the sun into the camera (its normal ~ the half vector) it flashes: a tiny,
- *    intense specular glint that twinkles as you move, only in sunlight (uses the shadow term),
- *    faded out at distance to avoid aliasing. That is what makes snow read as granular.
- *  - blue shadows come for free: shaded snow only receives the blue sky (IBL), sunlit snow gets the
- *    warm sun on top.
+ * SNOW. MeshStandardMaterial (GGX specular + image-based sky light + PCF soft shadows), rebuilt in
+ * onBeforeCompile around what makes real snow read as snow:
+ *  - SURFACE. Groomed pistes carry corduroy: ridges 2.4 cm apart laid by the groomer in 5.6 m wide
+ *    machine passes, each pass with its own phase and a faint seam. Earlier skiers have worn it
+ *    through: procedural OLD TRACKS (carvers' twin knife-edge grooves, snowboarders' trenches,
+ *    skidders' scraped, polished swaths with a berm of loose snow outside each turn). Clumps of
+ *    grains (3 cm and 11 cm Worley domes) everywhere; off the piste, wind-sculpted sastrugi instead
+ *    of corduroy. Detail that shrinks below a pixel is faded, never aliased - and corduroy too fine
+ *    to resolve still shades itself in grazing light across the ridges (micro-shadowing).
+ *  - LIGHT. Snow is a dense scattering medium, not a plastic. Sunlight diffuses through the grains
+ *    around the terminator (a wrapped, faintly blue subsurface term, so bumps shade softly); looking
+ *    toward a low sun the surface glows (forward scattering, stronger on crusted patches); shadows
+ *    are lit only by the blue sky (image-based light) and deepen under tree crowns and in hollows
+ *    (per-vertex AO); groomed snow is a little greyer and smoother than fresh powder.
+ *  - GLITTER. Every surface cell (3 cm near, 12 cm further out) holds one ice-crystal facet with a
+ *    random tilt. When it mirrors the sun into the camera it flashes: a tiny, intense glint that
+ *    twinkles as you move, only in sunlight, fading out before it could alias.
  */
+const SNOW_GLSL = /* glsl */`
+// Old ski tracks in one family of lanes L metres wide (see the comment above makeSnowMaterial).
+// uz = (u across the piste, z along it), px = metres per pixel. Adds the surface tilt (in u, z)
+// and info = (polished swath, groove, loose-snow berm).
+void flTrackLanes(vec2 uz, float px, float L, float fam, inout vec2 tilt, inout vec3 info) {
+  float base = floor(uz.x / L);
+  for (int k = -1; k <= 1; k++) {
+    float li = base + float(k);
+    vec3 h = flHash32(vec2(li * 1.31 + 3.7, fam));
+    vec3 g = flHash32(vec2(li * 0.73 - 5.1, fam * 2.3 + 9.0));
+    float stretch = floor(uz.y / 110.0 + g.z * 5.0);                 // each track covers stretches of the run
+    if (flHash12(vec2(li * 1.7 + stretch * 3.1, fam + 4.0)) < 0.38) continue;
+    float A = 0.35 + 3.0 * h.x * h.x;                                // turn amplitude (m)
+    float lam = 11.0 + 26.0 * h.y;                                   // turn length (m)
+    float th = 6.2832 * (uz.y / lam + h.z);
+    float c = (li + 0.5) * L + A * sin(th);
+    float dudz = A * 6.2832 / lam * cos(th);
+    float inv = inversesqrt(1.0 + dudz * dudz);
+    float d = (uz.x - c) * inv;                                      // signed distance across the track (m)
+    vec2 across = vec2(1.0, -dudz) * inv;
+    float age = 0.4 + 0.6 * g.x;                                     // older tracks are softer
+    if (g.y < 0.5) {                                                 // carver: two skis 18 cm apart, each pressing
+      float inside = sign(cos(th));                                  // a 7 cm base band flat and cutting a groove
+      for (int s = 0; s < 2; s++) {                                  // with its inside edge
+        float e = d - (float(s) * 2.0 - 1.0) * 0.09;
+        info.x = max(info.x, (1.0 - smoothstep(0.035, 0.035 + max(0.01, px), abs(e))) * age * 0.7);
+        float eg = e - inside * 0.035;
+        float w = max(0.014, px * 0.75), cov = 0.014 / w;
+        float inG = 1.0 - smoothstep(0.6, 1.0, abs(eg) / w);
+        tilt -= across * sign(eg) * inG * 0.55 * cov * age;
+        info.y = max(info.y, inG * (0.25 + 0.75 * cov) * age);
+      }
+    } else if (g.y < 0.8) {                                          // skidder: scraped swath, berm outside the turn
+      float sk = abs(sin(th));
+      float hw = 0.13 + 0.5 * sk * sk;
+      info.x = max(info.x, (1.0 - smoothstep(hw - 0.05, hw + max(0.03, px), abs(d))) * age);
+      float b = (abs(d) - hw - 0.08) / 0.09;
+      float berm = max(1.0 - b * b, 0.0) * step(0.0, sin(th) * d) * sk * age;
+      info.z = max(info.z, berm);
+      tilt += across * sign(d) * b * 0.7 * berm * (1.0 - smoothstep(0.04, 0.08, px));
+    } else {                                                         // snowboard: one wide trench
+      float w = max(0.12, px), cov = 0.12 / w;
+      float inG = 1.0 - smoothstep(0.7, 1.0, abs(d) / w);
+      tilt -= across * sign(d) * inG * 0.45 * cov * age;
+      info.y = max(info.y, inG * 0.6 * age);
+    }
+  }
+}
+`;
 function makeSnowMaterial() {
   const m = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.66, metalness: 0, envMapIntensity: 1 });
   m.userData.uTexOrigin = { value: new THREE.Vector2() };
@@ -1915,21 +1991,27 @@ function snowCompile(shader) {
   shader.uniforms.uTexOrigin = this.userData.uTexOrigin;
   shader.uniforms.uGrain = { value: TEX.grain };
   shader.uniforms.uWind = { value: TEX.wind };
+  shader.uniforms.uPillow = { value: TEX.pillow };
   shader.uniforms.uRock = { value: TEX.rock };
   shader.uniforms.uSparkle = U.uSparkle;
   patchCommon(shader,
-    'attribute vec4 aSnow;\nuniform vec2 uTexOrigin;\nvarying vec4 vSnow;\nvarying vec2 vTC;\nvarying vec3 vWN;\n',
-    'uniform sampler2D uGrain;\nuniform sampler2D uWind;\nuniform sampler2D uRock;\nuniform float uSparkle;\nvarying vec4 vSnow;\nvarying vec2 vTC;\nvarying vec3 vWN;\n' + FOREST_GLSL);
+    'attribute vec4 aSnow;\nattribute vec2 aAO;\nuniform vec2 uTexOrigin;\nvarying vec4 vSnow;\nvarying vec2 vAO;\nvarying vec2 vTC;\nvarying vec3 vWN;\n',
+    'uniform sampler2D uGrain;\nuniform sampler2D uWind;\nuniform sampler2D uPillow;\nuniform sampler2D uRock;\nuniform float uSparkle;\nvarying vec4 vSnow;\nvarying vec2 vAO;\nvarying vec2 vTC;\nvarying vec3 vWN;\n' + FOREST_GLSL + SNOW_GLSL);
   let v = shader.vertexShader;
-  v = hook(v, '#include <begin_vertex>', '#include <begin_vertex>\nvSnow = aSnow;\nvTC = position.xz + uTexOrigin;\nvWN = normalize(mat3(modelMatrix) * objectNormal);', 'snow-v');
+  v = hook(v, '#include <begin_vertex>', '#include <begin_vertex>\nvSnow = aSnow;\nvAO = aAO;\nvTC = position.xz + uTexOrigin;\nvWN = normalize(mat3(modelMatrix) * objectNormal);', 'snow-v');
   shader.vertexShader = v;
   let f = shader.fragmentShader;
   f = hook(f, '#include <map_fragment>', /* glsl */`
     float flDist = length(vFW - cameraPosition);
     vec3 flN = normalize(vWN);
+    float flPx = max(length(fwidth(vFW)), 1e-4);                     // metres per pixel here
+    float flPiste = 1.0 - smoothstep(vSnow.y - 5.0, vSnow.y + 1.0, abs(vSnow.x));
+    float flGroomed = vSnow.z * flPiste;                              // the machine-groomed corridor
+    float flIce = vSnow.w;
     vec4 flGr = texture2D(uGrain, vTC * (1.0 / 1.6));
     vec4 flWi = texture2D(uWind, vTC * (1.0 / 16.0));
     vec4 flBig = texture2D(uWind, (vTC + vFW.y * vec2(0.63, -0.41)) * (1.0 / 64.0) + 0.37);
+    vec4 flHuge = texture2D(uWind, vTC * (1.0 / 512.0) + 0.11);
     float flSlope = 1.0 - flN.y;
     // rock: crisp-edged outcrops on faces too steep to hold snow (two noise scales break the edge)
     float flRockAmt = smoothstep(0.33, 0.41, flSlope + (flBig.b - 0.5) * 0.22 + (flWi.b - 0.5) * 0.07);
@@ -1939,45 +2021,111 @@ function snowCompile(shader) {
       vec3 P = vec3(vTC.x, vFW.y, vTC.y) / 6.0;
       flRockCol = sRGBToLinear(texture2D(uRock, P.zy)).rgb * w.x + sRGBToLinear(texture2D(uRock, P.xz)).rgb * w.y + sRGBToLinear(texture2D(uRock, P.xy)).rgb * w.z;
     }
-    vec3 flAlb = vec3(0.86, 0.9, 0.955) * (0.94 + 0.09 * flBig.b + 0.04 * (flGr.b - 0.5));
-    float flIce = vSnow.w;
-    flAlb = mix(flAlb, vec3(0.6, 0.7, 0.83), flIce * 0.75);
     float flAway = abs(vSnow.x) - vSnow.y;
     float flForestD = smoothstep(118.0, 150.0, flAway) * smoothstep(0.34, 0.6, flBig.b + 0.3 * (flWi.b - 0.5)) * (1.0 - flRockAmt);
     float flForest = flTreeDots(vTC, flForestD * 0.9, flN);
     vec3 flForestCol = mix(vec3(0.02, 0.04, 0.028), vec3(0.62, 0.66, 0.72), 0.16 + 0.2 * smoothstep(0.5, 0.78, flGr.b));
+
+    // --- piste surface: earlier skiers' tracks, then the groomer's corduroy between them
+    vec2 flTilt = vec2(0.0);
+    vec3 flTr = vec3(0.0);
+    if (flGroomed > 0.02 && flDist < 140.0) {
+      vec2 flUZ = vec2(vSnow.x, vTC.y);
+      flTrackLanes(flUZ, flPx, 7.3, 1.0, flTilt, flTr);
+      flTrackLanes(flUZ + vec2(3.1, 0.0), flPx, 10.9, 2.0, flTilt, flTr);
+      flTrackLanes(flUZ + vec2(1.7, 0.0), flPx, 5.2, 3.0, flTilt, flTr);
+      flTilt *= flGroomed; flTr *= flGroomed;
+    }
+    vec3 flPh = flHash32(vec2(floor(vSnow.x / 5.6), 7.0));           // this machine pass
+    float flCordS = fract((vSnow.x + vTC.y * (flPh.x - 0.5) * 0.01) / 0.024 + flPh.y * 17.0) * 2.0 - 1.0;
+    float flCordAA = 1.0 - smoothstep(0.3, 0.6, flPx / 0.024);       // ridges resolved?
+    float flCordAmt = flGroomed * (1.0 - flTr.x) * (1.0 - flIce * 0.7) * (0.75 + 0.25 * flPh.z);
+    float flCordFar = flCordAmt * (1.0 - flCordAA);                   // unresolved: micro-shadowing instead
+    // the groomer's last pass leaves a low berm where the piste meets untouched powder
+    float flEdgeE = (abs(vSnow.x) - vSnow.y + 1.2) / 0.55;
+    float flEdge = max(1.0 - flEdgeE * flEdgeE, 0.0) * vSnow.z * (1.0 - smoothstep(0.08, 0.2, flPx));
+    flTilt.x += sign(vSnow.x) * flEdgeE * 0.55 * flEdge;
+    float flSeamE = (fract(vSnow.x / 5.6 + 0.5) - 0.5) * 5.6;
+    float flSeam = max(1.0 - abs(flSeamE) / 0.05, 0.0) * flGroomed * (1.0 - flTr.x) * (1.0 - smoothstep(0.03, 0.08, flPx));
+    flTilt.x += flCordS * 0.5 * flCordAA * flCordAmt + sign(flSeamE) * flSeam * 0.45;
+    // --- grains everywhere: crystal clusters, and close up a fine sugary crust of single grains
+    float flFine = 1.0 - smoothstep(12.0, 45.0, flDist);
+    vec4 flSu = texture2D(uGrain, vTC * (1.0 / 0.4) + 0.29);
+    float flSugarK = (1.0 - smoothstep(4.0, 14.0, flDist)) * (1.0 - 0.6 * flTr.x) * (1.0 - flIce);
+    flTilt += (flGr.xy * 2.0 - 1.0) * mix(0.3, 0.16, flGroomed) * flFine * (1.0 - 0.75 * flTr.x) * (1.0 - flIce * 0.8);
+    flTilt += (flSu.xy * 2.0 - 1.0) * 0.22 * flSugarK;
+    // --- untouched snow: soft pillows of wind-deposited powder and wind-sculpted sastrugi
+    vec4 flPi = texture2D(uPillow, vTC * (1.0 / 32.0) + 0.53);
+    float flPowder = (1.0 - flGroomed) * (1.0 - flIce) * mix(0.45, 1.0, 1.0 - flPiste);
+    flTilt += (flPi.xy * 2.0 - 1.0) * 0.42 * flPowder;
+    flTilt += (flWi.xy * 2.0 - 1.0) * 0.22 * (0.2 + flBig.b) * (1.0 - flGroomed) * (1.0 - flIce);
+    vec3 flNw = normalize(flN + vec3(flTilt.x, 0.0, flTilt.y) * (1.0 - flRockAmt) * (1.0 - flForest * 0.6));
+    vec3 flNv = normalize((viewMatrix * vec4(flNw, 0.0)).xyz);
+
+    // --- albedo
+    float flCrust = smoothstep(0.58, 0.78, flHuge.b + 0.25 * (flBig.b - 0.5));   // sun / wind crust patches
+    vec3 flAlb = mix(vec3(0.845, 0.87, 0.905), vec3(0.91, 0.925, 0.95), 1.0 - flGroomed)
+               * (0.955 + 0.06 * flBig.b + 0.05 * (flGr.b - 0.5) * flFine + 0.08 * (flSu.b - 0.5) * flSugarK) * (1.0 + (flPh.z - 0.5) * 0.03 * flGroomed);
+    flAlb *= (1.0 - 0.09 * flTr.y) * (1.0 - 0.03 * flTr.x) * mix(0.95, 1.0, vAO.x);
+    flAlb = mix(flAlb, vec3(0.93, 0.945, 0.965), flTr.z * 0.6);      // loose snow on the berms
+    flAlb = mix(flAlb, vec3(0.6, 0.7, 0.83), flIce * 0.75);
     flAlb = mix(flAlb, flRockCol, flRockAmt);
     flAlb = mix(flAlb, flForestCol, flForest);
     diffuseColor.rgb = flAlb;
-    float flRough = mix(0.68, 0.52, vSnow.z * 0.7) - 0.06 * flGr.b;
+    float flRough = mix(0.74, 0.62, flGroomed) - 0.05 * flGr.b * flFine;
+    flRough = mix(flRough, 0.44, flTr.x);
+    flRough -= 0.16 * flCrust;
     flRough = mix(flRough, 0.16, flIce);
     flRough = mix(flRough, 0.84, max(flRockAmt, flForest));
-    // detail normals, perturbed in world space (the terrain is a height field)
-    float flFine = 1.0 - smoothstep(18.0, 70.0, flDist);
-    vec2 flP = (flGr.xy * 2.0 - 1.0) * 0.22 * flFine * (1.0 - flIce * 0.8)
-             + (flWi.xy * 2.0 - 1.0) * 0.27 * (0.35 + flBig.b) * (1.0 - vSnow.z * 0.75) * (1.0 - flIce);   // patchy wind ripples
-    float flCordW = fwidth(vTC.x) / 0.042;           // corduroy cycles per pixel (anti-aliasing fade)
-    flP.x += cos(vTC.x * 149.6) * 0.13 * vSnow.z * (1.0 - smoothstep(0.2, 0.5, flCordW)) * (1.0 - flIce);
-    vec3 flNw = normalize(flN + vec3(flP.x, 0.0, flP.y) * (1.0 - flRockAmt) * (1.0 - flForest * 0.6));
-    vec3 flNv = normalize((viewMatrix * vec4(flNw, 0.0)).xyz);
+    float flAO = vAO.x * mix(1.0, vAO.y, 1.0 - flRockAmt);
   `, 'snow-map');
   f = hook(f, '#include <roughnessmap_fragment>', 'float roughnessFactor = clamp(flRough, 0.05, 1.0);', 'snow-rough');
   f = hook(f, '#include <metalnessmap_fragment>', 'float metalnessFactor = 0.0;', 'snow-metal');
   f = hook(f, '#include <normal_fragment_maps>', 'normal = flNv;', 'snow-normal');
   f = hook(f, '#include <aomap_fragment>', /* glsl */`
     {
-      // ice-crystal glitter (see the comment above makeSnowMaterial)
-      vec3 flVv = normalize(cameraPosition - vFW);
-      vec3 flH = normalize(uSunDir + flVv);
-      vec2 flCp = vTC * 30.0;
-      vec3 flR = flHash32(floor(flCp));
-      vec3 flFacet = normalize(flN * 0.9 + vec3(flR.x - 0.5, flR.z * 0.4, flR.y - 0.5) * 1.5);
-      float flGlint = pow(max(dot(flFacet, flH), 0.0), 1400.0);
-      float flSpot = 1.0 - smoothstep(0.04, 0.2, length(fract(flCp) - (0.2 + 0.6 * flR.zx)));
-      float flFade = (1.0 - smoothstep(10.0, 34.0, flDist)) * (1.0 - flIce * 0.4) * (1.0 - flRockAmt) * (1.0 - flForest);
-      reflectedLight.directSpecular += uSunColor * flGlint * flSpot * flFade * flSunShadow * uSparkle * 70.0;
+      vec3 flLv = normalize((viewMatrix * vec4(uSunDir, 0.0)).xyz);
+      float flNdl = dot(normal, flLv);
+      float flSnowK = (1.0 - flRockAmt) * (1.0 - flForest);
+      // unresolved corduroy in grazing light across its ridges: the lee flanks fall in shade
+      float flMs = clamp(1.0 - max(dot(flNw, uSunDir), 0.0) / (abs(uSunDir.x) * 0.5 + 1e-3), 0.0, 1.0) * 0.45 * flCordFar;
+      reflectedLight.directDiffuse *= 1.0 - flMs;
+      reflectedLight.directSpecular *= 1.0 - flMs;
+      // subsurface: sunlight diffusing through the grains round the terminator (soft, blue-tinted,
+      // since longer paths through ice lose the red first)
+      float flWrap = clamp((flNdl + 0.6) / 1.6, 0.0, 1.0);
+      float flSSS = max(flWrap * flWrap - max(flNdl, 0.0), 0.0);
+      reflectedLight.directDiffuse += uSunColor * flSunShadow * diffuseColor.rgb * vec3(0.45, 0.78, 1.0) * flSSS * 1.0 * flSnowK;
+      // interreflection: with an albedo near 0.9, shaded snow is lit not only by the blue sky but
+      // by the sunlit snow all around it - which is why snow shadows are bright, luminous blue
+      // (each bounce off ice loses a little red, so the light pooled in snow shadows turns cyan-blue)
+      reflectedLight.indirectDiffuse += diffuseColor.rgb * uSunColor * max(uSunDir.y, 0.12) * vec3(0.46, 0.76, 1.0) * 0.3 * flAO * flSnowK;
+      // forward scattering: snow glows when you look across it toward a low sun
+      float flGraze = 1.0 - clamp(dot(normal, geometry.viewDir), 0.0, 1.0);
+      float flFwd = pow(max(dot(-geometry.viewDir, flLv), 0.0), 6.0) * flGraze * flGraze * clamp(flNdl + 0.3, 0.0, 1.0);
+      reflectedLight.directSpecular += uSunColor * flSunShadow * flFwd * (0.3 + 0.35 * flCrust + 0.2 * flTr.x) * flSnowK;
+      // sky light hidden by tree crowns and hollows
+      reflectedLight.indirectDiffuse *= flAO;
+      reflectedLight.indirectSpecular *= flAO;
+      // ice-crystal glitter: 3 cm facets near, 12 cm facets further out
+      vec3 flH = normalize(uSunDir + normalize(cameraPosition - vFW));
+      float flK = uSparkle * flSunShadow * flSnowK * (1.0 - flIce * 0.4) * (1.0 - 0.6 * flTr.x) * mix(1.0, 1.35, 1.0 - flGroomed);
+      vec2 flC1 = vTC * 30.0; vec3 flR1 = flHash32(floor(flC1));
+      vec3 flF1 = normalize(flN * 0.9 + vec3(flR1.x - 0.5, flR1.z * 0.4, flR1.y - 0.5) * 1.5);
+      float flG1 = pow(max(dot(flF1, flH), 0.0), 1400.0) * (1.0 - smoothstep(0.04, 0.2, length(fract(flC1) - (0.2 + 0.6 * flR1.zx))))
+                 * (1.0 - smoothstep(10.0, 30.0, flDist));
+      vec2 flC2 = vTC * 8.0 + 0.37; vec3 flR2 = flHash32(floor(flC2) + 91.0);
+      vec3 flF2 = normalize(flN * 0.9 + vec3(flR2.x - 0.5, flR2.z * 0.4, flR2.y - 0.5) * 1.5);
+      float flG2 = pow(max(dot(flF2, flH), 0.0), 2000.0) * (1.0 - smoothstep(0.05, 0.16, length(fract(flC2) - (0.2 + 0.6 * flR2.zx))))
+                 * smoothstep(12.0, 24.0, flDist) * (1.0 - smoothstep(55.0, 90.0, flDist));
+      // (and very close, 1.2 cm grains in a broader lobe: the dense sugary sparkle of fresh snow)
+      vec2 flC3 = vTC * 83.0 + 0.71; vec3 flR3 = flHash32(floor(flC3) + 17.0);
+      vec3 flF3 = normalize(flN + vec3(flR3.x - 0.5, flR3.z * 0.3, flR3.y - 0.5) * 1.2);
+      float flG3 = pow(max(dot(flF3, flH), 0.0), 700.0) * (1.0 - smoothstep(0.08, 0.22, length(fract(flC3) - (0.25 + 0.5 * flR3.zx))))
+                 * (1.0 - smoothstep(3.0, 9.0, flDist));
+      reflectedLight.directSpecular += uSunColor * (flG1 * 70.0 + flG2 * 110.0 + flG3 * 30.0) * flK;
     }
-  `, 'snow-sparkle');
+  `, 'snow-light');
   shader.fragmentShader = f;
 }
 // Trees, rocks, gates: standard PBR + shared fog / shadow-fade patch; rocks also get a
@@ -2161,11 +2309,41 @@ function stepBuild(seg, deadline) {
   finishBuild(seg);
   return true;
 }
+// Sky occlusion by tree crowns for the terrain AO: trees of this segment and its neighbours in a
+// 6 m bucket grid. Snow under and right around a spruce sees little sky (and holds a tree well).
+function treeLookup(seg) {
+  const B = new Map(), CELL = 6;
+  for (let i = seg.index - 1; i <= seg.index + 1; i++) {
+    const sg = world.segments.get(i);
+    if (!sg) continue;
+    for (const t of sg.trees) {
+      const key = Math.floor(t.x / CELL) * 73856093 ^ Math.floor(t.z / CELL) * 19349663;
+      let list = B.get(key); if (!list) B.set(key, list = []);
+      list.push(t);
+    }
+  }
+  return (x, z) => {
+    let ao = 1;
+    const cx = Math.floor(x / CELL), cz = Math.floor(z / CELL);
+    for (let a = -1; a <= 1; a++) {
+      for (let b = -1; b <= 1; b++) {
+        const list = B.get((cx + a) * 73856093 ^ (cz + b) * 19349663);
+        if (!list) continue;
+        for (const t of list) {
+          const reach = 0.24 * t.height * 1.7 + 0.6, d = Math.hypot(x - t.x, z - t.z);
+          if (d < reach) { const q = 1 - d / reach; ao *= 1 - 0.5 * q * q; }
+        }
+      }
+    }
+    return Math.max(ao, 0.45);
+  };
+}
 function finishBuild(seg) {
   const J = seg.job, R = J.rows, C = J.nc;
   const skirt = 2 * C;
   const nv = R * C + skirt;
-  const pos = new Float32Array(nv * 3), nrm = new Float32Array(nv * 3), snow = new Float32Array(nv * 4);
+  const pos = new Float32Array(nv * 3), nrm = new Float32Array(nv * 3), snow = new Float32Array(nv * 4), ao = new Float32Array(nv * 2);
+  const treeAt = treeLookup(seg);
   const z0 = seg.z0;
   const at = (r, c) => (r + 1) * C + c;                   // index into the bordered sample arrays
   for (let r = 0; r < R; r++) {
@@ -2181,6 +2359,13 @@ function finishBuild(seg) {
       const l = Math.hypot(nx, ny, nz) || 1;
       nrm[i * 3] = nx / l; nrm[i * 3 + 1] = ny / l; nrm[i * 3 + 2] = nz / l;
       snow.set(J.S.subarray(i * 4, i * 4 + 4), i * 4);
+      // AO: sky hidden by nearby tree crowns (tree wells), and hollows (curvature of the grid)
+      const dxl = Math.max(J.X[at(r, c)] - J.X[at(r, cl)], 1e-3), dxr = Math.max(J.X[at(r, cr)] - J.X[at(r, c)], 1e-3);
+      const y0 = J.Y[at(r, c)], dzz = (J.Z[r + 2] - J.Z[r]) * 0.5;
+      const kx = cl === c || cr === c ? 0 : 2 * ((J.Y[at(r, cr)] - y0) / dxr - (y0 - J.Y[at(r, cl)]) / dxl) / (dxl + dxr);
+      const kz = (J.Y[at(r + 1, c)] - 2 * y0 + J.Y[at(r - 1, c)]) / (dzz * dzz);
+      ao[i * 2] = treeAt(J.X[k], J.Z[r + 1]);
+      ao[i * 2 + 1] = clamp(1 - 0.12 * (kx + kz), 0.84, 1.04);
     }
   }
   // skirts: copies of the first & last rows pushed 3 m down
@@ -2191,6 +2376,7 @@ function finishBuild(seg) {
       pos[dst * 3] = pos[src * 3]; pos[dst * 3 + 1] = pos[src * 3 + 1] - 3; pos[dst * 3 + 2] = pos[src * 3 + 2];
       nrm[dst * 3] = nrm[src * 3]; nrm[dst * 3 + 1] = nrm[src * 3 + 1]; nrm[dst * 3 + 2] = nrm[src * 3 + 2];
       snow.set(snow.subarray(src * 4, src * 4 + 4), dst * 4);
+      ao[dst * 2] = ao[src * 2]; ao[dst * 2 + 1] = ao[src * 2 + 1];
     }
   }
   const quads = (R - 1) * (C - 1) + 2 * (C - 1);
@@ -2219,6 +2405,7 @@ function finishBuild(seg) {
   g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   g.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
   g.setAttribute('aSnow', new THREE.BufferAttribute(snow, 4));
+  g.setAttribute('aAO', new THREE.BufferAttribute(ao, 2));
   g.setIndex(new THREE.BufferAttribute(idx, 1));
   g.addGroup(0, seg.coreCount, 0);
   g.addGroup(seg.coreCount, idx.length - seg.coreCount, 1);
