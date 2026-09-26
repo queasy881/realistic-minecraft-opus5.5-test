@@ -385,10 +385,11 @@ const TSHADOW = {
 const LIGHT_PRESETS = {
   //           sun elevation / azimuth (deg from the downhill direction, + = left), haze
   // (the valley walls rise ~25-30 deg as seen from the run: a sun from the side or behind would
-  // leave it in their shadow all day; ahead-left / ahead-right it clears them on most stretches)
-  morning:   { el: 24, az: -60, haze: 0.9, tint: [1.0, 0.97, 0.93] },
-  afternoon: { el: 24, az: 55, haze: 1.0, tint: [1.0, 0.95, 0.88] },
-  golden:    { el: 10, az: 40, haze: 1.35, tint: [1.0, 0.82, 0.62] },
+  // leave it in their shadow all day; ahead-left / ahead-right it clears them on most stretches.
+  // azs: candidate azimuths, most side-on first - each run takes the first that lights its start)
+  morning:   { el: 27, az: -66, azs: [-68, -60, -52, -44], haze: 0.9, tint: [1.0, 0.97, 0.93] },
+  afternoon: { el: 29, az: 72, azs: [72, 64, 56, 48], haze: 1.0, tint: [1.0, 0.95, 0.88] },
+  golden:    { el: 10, az: 40, azs: [42, 34, 26, 18], haze: 1.35, tint: [1.0, 0.82, 0.62] },
 };
 
 const GAME = {
@@ -1619,9 +1620,9 @@ function updateEnvironment() {
   envRT = rt;
 }
 // Sun direction & colour from the light preset (colour from atmospheric transmittance).
-function applyLight(presetName) {
+function applyLight(presetName, azDeg) {
   const L = LIGHT_PRESETS[presetName] || LIGHT_PRESETS.afternoon;
-  const el = L.el * DEG, az = L.az * DEG;
+  const el = L.el * DEG, az = (azDeg === undefined ? L.az : azDeg) * DEG;
   U.uSunDir.value.set(Math.sin(az) * Math.cos(el), Math.sin(el), Math.cos(az) * Math.cos(el)).normalize();
   const am = 1 / (Math.sin(el) + 0.50572 * Math.pow(L.el + 6.07995, -1.6364));
   const tr = [Math.exp(-0.028 * am), Math.exp(-0.062 * am), Math.exp(-0.14 * am)];
@@ -1642,6 +1643,31 @@ function applyLight(presetName) {
   U.uGroundColor.value.setRGB(gr(0, 0.86), gr(1, 0.9), gr(2, 0.955));
   updateEnvironment();
   invalidateTerrainShadows();
+  // exposure follows the light, as a photographer's would: a higher sun lights the snow more, so
+  // expose a little less (sunlit snow stays just short of white, its relief readable)
+  const expo = VISUAL.EXPOSURE * clamp(Math.sqrt(Math.sin(19 * DEG) / Math.sin(Math.max(L.el, 5) * DEG)), 0.8, 1.08);
+  renderer.toneMappingExposure = expo;
+  if (post.mats && post.mats.final) post.mats.final.uniforms.uExposure.value = expo;
+}
+// Light a new run: of the preset's candidate azimuths (most side-on first, for the best relief on
+// the snow) take the first that puts the first 500 m of the run in sunshine - the valley walls
+// would otherwise leave some starts in shade all day. (Needs the far field built.)
+function chooseLight(presetName) {
+  const L = LIGHT_PRESETS[presetName] || LIGHT_PRESETS.afternoon;
+  let az = L.az;
+  if (farField.valid && L.azs) {
+    const c = world.course, p = {}, el = L.el * DEG;
+    let best = -1;
+    for (const a of L.azs) {
+      U.uSunDir.value.set(Math.sin(a * DEG) * Math.cos(el), Math.sin(el), Math.cos(a * DEG) * Math.cos(el));
+      let lit = 0, n = 0;
+      for (let z = 10; z < 500; z += 20) { c.sample(z, p); lit += sunVisibility(p.center, c.height(p.center, z), z); n++; }
+      lit /= n;
+      if (lit > best + 0.05) { best = lit; az = a; }
+      if (lit >= 0.9) break;
+    }
+  }
+  applyLight(presetName, az);
 }
 
 // ---------------------------------------------------------------- post-processing
@@ -2654,6 +2680,8 @@ function startBuild(seg, lod) {
 }
 function stepBuild(seg, deadline) {
   const J = seg.job, course = world.course, p = {};
+  // tree wells (finest LOD only, where the 0.8 m grid resolves them)
+  if (J.lod === 0 && J.row === -1 && !J.well) J.well = treeWellLookup(seg);
   while (J.row <= J.rows) {
     const r = J.row, z = seg.z0 + r * (TERRAIN.SEG_LEN / (J.rows - 1));
     course.sample(z, p);
@@ -2663,6 +2691,7 @@ function stepBuild(seg, deadline) {
       const x = p.center + J.cols[c];
       J.X[base + c] = x;
       J.Y[base + c] = course.heightP(x, z, p);
+      if (J.well && Math.abs(J.cols[c]) < TERRAIN.CORE) J.Y[base + c] -= J.well(x, z);
       if (r >= 0 && r < J.rows) {
         const si = (r * J.nc + c) * 4;
         J.S[si] = J.cols[c]; J.S[si + 1] = p.halfW; J.S[si + 2] = p.groom; J.S[si + 3] = course.iceAt(x, z, p);
@@ -2673,6 +2702,37 @@ function stepBuild(seg, deadline) {
   }
   finishBuild(seg);
   return true;
+}
+// Tree wells: under a spruce's crown little snow falls and what does settles and melts back from
+// the trunk, leaving a bowl around it (depth ~3% of the tree's height, about a crown radius wide).
+// Visual only: it lies inside the trunk's collision radius plus a metre or so.
+function treeWellLookup(seg) {
+  const B = new Map(), CELL = 4;
+  for (let i = seg.index - 1; i <= seg.index + 1; i++) {
+    const sg = world.segments.get(i);
+    if (!sg) continue;
+    for (const t of sg.trees) {
+      const key = Math.floor(t.x / CELL) * 73856093 ^ Math.floor(t.z / CELL) * 19349663;
+      let list = B.get(key); if (!list) B.set(key, list = []);
+      list.push(t);
+    }
+  }
+  if (!B.size) return null;
+  return (x, z) => {
+    let d = 0;
+    const cx = Math.floor(x / CELL), cz = Math.floor(z / CELL);
+    for (let a = -1; a <= 1; a++) {
+      for (let b = -1; b <= 1; b++) {
+        const list = B.get((cx + a) * 73856093 ^ (cz + b) * 19349663);
+        if (!list) continue;
+        for (const t of list) {
+          const rw = 0.08 * t.height + 0.4, q = ((x - t.x) * (x - t.x) + (z - t.z) * (z - t.z)) / (rw * rw);
+          if (q < 1) d = Math.max(d, 0.028 * t.height * (1 - q) * (1 - q));
+        }
+      }
+    }
+    return d;
+  };
 }
 // Sky occlusion by tree crowns for the terrain AO: trees of this segment and its neighbours in a
 // 6 m bucket grid. Snow under and right around a spruce sees little sky (and holds a tree well).
@@ -4304,7 +4364,7 @@ const UI = {
         cb(b.dataset.v);
       });
     };
-    seg('opt-light', (v) => { Game.light = v; applyLight(v); });
+    seg('opt-light', (v) => { Game.light = v; chooseLight(v); });
     seg('opt-gates', (v) => { Game.gates = v === 'on'; Game.newRun(Game.seed, true); });
     seg('opt-quality', (v) => { Game.quality = v; applyQuality(v === 'high' || v === 'auto' ? 0 : v === 'medium' ? 1 : 2); });
     $('start-btn').addEventListener('click', () => { AUDIO.init(); Game.start(); });
@@ -4462,6 +4522,8 @@ const Game = {
     updateStreaming(s.pos.z, 400);
     rebuildInstances(s.pos.x, s.pos.z);
     rebuildGates();
+    updateFarField(s.pos.z, 20);
+    chooseLight(this.light);
     void keepState;
   },
   start() {
@@ -4619,7 +4681,7 @@ function fatal(html) {
   $('start-btn').textContent = 'Unavailable';
 }
 // Small hook for automated tests / console tinkering.
-const FREELINE = window.FREELINE = { debugCam: null, farField, internals: { updateStreaming, rebuildInstances, updateFarField, rebuildGates, renderFrame, TRACKS, SPRAY, sunVisibility, terrainSunAt, terrSun, flushTerrainShadows, TEX, LIGHT_PRESETS }, Game, skier, run, world, input, PHYS, TERRAIN, VISUAL, U, post, PERF, physicsStep, applyLight, applyQuality, get renderer() { return renderer; }, get camera() { return camera; } };
+const FREELINE = window.FREELINE = { debugCam: null, farField, internals: { updateStreaming, rebuildInstances, updateFarField, rebuildGates, renderFrame, TRACKS, SPRAY, sunVisibility, terrainSunAt, terrSun, flushTerrainShadows, resetFarField, chooseLight, TEX, LIGHT_PRESETS }, Game, skier, run, world, input, PHYS, TERRAIN, VISUAL, U, post, PERF, physicsStep, applyLight, applyQuality, get renderer() { return renderer; }, get camera() { return camera; } };
 boot().catch((err) => { console.error(err); fatal('Something went wrong while starting.<br><small>' + String(err && err.message || err) + '</small>'); });
 
 })();
